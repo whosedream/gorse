@@ -1,0 +1,7 @@
+{
+  "tool_name": "PowerShell",
+  "tool_input_preview": "{\"command\":\"git rev-parse --git-dir; git rev-parse --git-common-dir; git branch --show-current\",\"timeout\":120000,\"description\":\"Check git worktree state\"}",
+  "error": "Exit code 128\nfatal: not a git repository (or any of the parent directories): .git\nfatal: not a git repository (or any of the parent directories): .git\nfatal: not a git repository (or any of the parent directories): .git",
+  "timestamp": "2026-05-24T18:59:15.097Z",
+  "retry_count": 1
+}

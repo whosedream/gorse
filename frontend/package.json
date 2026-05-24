@@ -1,0 +1,31 @@
+{
+  "name": "go-rec-rerank-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "lint": "eslint ./src"
+  },
+  "dependencies": {
+    "vue": "latest",
+    "vuetify": "latest"
+  },
+  "devDependencies": {
+    "@eslint/js": "latest",
+    "@formkit/auto-animate": "latest",
+    "@typescript-eslint/eslint-plugin": "latest",
+    "@typescript-eslint/parser": "latest",
+    "@vitejs/plugin-vue": "latest",
+    "eslint": "latest",
+    "eslint-plugin-vue": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vite-plugin-checker": "latest",
+    "vite-plugin-vuetify": "latest",
+    "vue-tsc": "latest"
+  }
+}

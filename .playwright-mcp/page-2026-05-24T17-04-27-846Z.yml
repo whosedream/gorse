@@ -1,0 +1,206 @@
+- main [ref=e5]:
+  - generic [ref=e6]:
+    - generic [ref=e7]:
+      - paragraph [ref=e8]: Go-Rec Dual Track Reranking
+      - heading "快轨不降速，慢轨懂意图" [level=1] [ref=e9]
+      - paragraph [ref=e10]: 点击任意猫咪商品后，慢轨模拟 DeepSeek 推理并回写热特征缓存；日志结束后切换 Set A -> Set B，商品网格自动重排。
+    - generic [ref=e11]:
+      - generic [ref=e12]:
+        - strong [ref=e13]: 25ms
+        - generic [ref=e14]: 快轨 P99 红线
+      - generic [ref=e15]:
+        - strong [ref=e16]: Idle
+        - generic [ref=e17]: 慢轨阶段
+      - generic [ref=e18]:
+        - strong [ref=e19]: Set A
+        - generic [ref=e20]: 当前排序
+  - generic [ref=e21]:
+    - generic [ref=e23]:
+      - generic [ref=e24]:
+        - generic [ref=e25]:
+          - paragraph [ref=e26]: Fast Track Ranking Surface
+          - heading "电商商品瀑布流重排" [level=2] [ref=e27]
+        - generic [ref=e29]: "Set A: 基线排序"
+      - generic [ref=e30]:
+        - generic [ref=e31] [cursor=pointer]:
+          - generic [ref=e32]: "#1"
+          - img "鲜肉冻干猫咪全价主粮 1.8kg" [ref=e34]:
+            - img "鲜肉冻干猫咪全价主粮 1.8kg" [ref=e35]
+            - alert "Loading..." [ref=e37]
+          - generic [ref=e39]:
+            - generic [ref=e40]:
+              - generic [ref=e42]: 猫咪用品
+              - generic [ref=e43]: score 0.74
+            - heading "鲜肉冻干猫咪全价主粮 1.8kg" [level=3] [ref=e44]
+            - generic [ref=e45]:
+              - generic [ref=e47]: 快轨候选
+              - generic [ref=e49]: 猫咪意图
+            - generic [ref=e50]:
+              - generic [ref=e51]: ¥169
+              - generic [ref=e52]: P99 < 25ms
+        - generic [ref=e53] [cursor=pointer]:
+          - generic [ref=e54]: "#2"
+          - img "旗舰影像手机 Pro 512GB" [ref=e56]:
+            - img "旗舰影像手机 Pro 512GB" [ref=e57]
+            - alert "Loading..." [ref=e59]
+          - generic [ref=e61]:
+            - generic [ref=e62]:
+              - generic [ref=e64]: 数码电子
+              - generic [ref=e65]: score 0.91
+            - heading "旗舰影像手机 Pro 512GB" [level=3] [ref=e66]
+            - generic [ref=e69]: 快轨候选
+            - generic [ref=e70]:
+              - generic [ref=e71]: ¥5,299
+              - generic [ref=e72]: P99 < 25ms
+        - generic [ref=e73] [cursor=pointer]:
+          - generic [ref=e74]: "#3"
+          - img "无尘混合豆腐猫砂 6L x 4" [ref=e76]:
+            - img "无尘混合豆腐猫砂 6L x 4" [ref=e77]
+          - generic [ref=e78]:
+            - generic [ref=e79]:
+              - generic [ref=e81]: 猫咪用品
+              - generic [ref=e82]: score 0.69
+            - heading "无尘混合豆腐猫砂 6L x 4" [level=3] [ref=e83]
+            - generic [ref=e84]:
+              - generic [ref=e86]: 快轨候选
+              - generic [ref=e88]: 猫咪意图
+            - generic [ref=e89]:
+              - generic [ref=e90]: ¥89
+              - generic [ref=e91]: P99 < 25ms
+        - generic [ref=e92] [cursor=pointer]:
+          - generic [ref=e93]: "#4"
+          - img "城市通勤缓震跑鞋" [ref=e95]:
+            - img "城市通勤缓震跑鞋" [ref=e96]
+          - generic [ref=e97]:
+            - generic [ref=e98]:
+              - generic [ref=e100]: 运动户外
+              - generic [ref=e101]: score 0.86
+            - heading "城市通勤缓震跑鞋" [level=3] [ref=e102]
+            - generic [ref=e105]: 快轨候选
+            - generic [ref=e106]:
+              - generic [ref=e107]: ¥459
+              - generic [ref=e108]: P99 < 25ms
+        - generic [ref=e109] [cursor=pointer]:
+          - generic [ref=e110]: "#5"
+          - img "幼猫高蛋白营养罐头 12 罐" [ref=e112]:
+            - img "幼猫高蛋白营养罐头 12 罐" [ref=e113]
+            - alert "Loading..." [ref=e115]
+          - generic [ref=e117]:
+            - generic [ref=e118]:
+              - generic [ref=e120]: 猫咪用品
+              - generic [ref=e121]: score 0.66
+            - heading "幼猫高蛋白营养罐头 12 罐" [level=3] [ref=e122]
+            - generic [ref=e123]:
+              - generic [ref=e125]: 快轨候选
+              - generic [ref=e127]: 猫咪意图
+            - generic [ref=e128]:
+              - generic [ref=e129]: ¥118
+              - generic [ref=e130]: P99 < 25ms
+        - generic [ref=e131] [cursor=pointer]:
+          - generic [ref=e132]: "#6"
+          - img "冷萃精品咖啡豆礼盒" [ref=e134]:
+            - alert "Loading..." [ref=e136]
+          - generic [ref=e138]:
+            - generic [ref=e139]:
+              - generic [ref=e141]: 食品饮料
+              - generic [ref=e142]: score 0.83
+            - heading "冷萃精品咖啡豆礼盒" [level=3] [ref=e143]
+            - generic [ref=e146]: 快轨候选
+            - generic [ref=e147]:
+              - generic [ref=e148]: ¥139
+              - generic [ref=e149]: P99 < 25ms
+        - generic [ref=e150] [cursor=pointer]:
+          - generic [ref=e151]: "#7"
+          - img "智能循环猫咪饮水机 2.5L" [ref=e153]
+          - generic [ref=e154]:
+            - generic [ref=e155]:
+              - generic [ref=e157]: 猫咪用品
+              - generic [ref=e158]: score 0.71
+            - heading "智能循环猫咪饮水机 2.5L" [level=3] [ref=e159]
+            - generic [ref=e160]:
+              - generic [ref=e162]: 快轨候选
+              - generic [ref=e164]: 猫咪意图
+            - generic [ref=e165]:
+              - generic [ref=e166]: ¥229
+              - generic [ref=e167]: P99 < 25ms
+        - generic [ref=e168] [cursor=pointer]:
+          - generic [ref=e169]: "#8"
+          - img "轻量商务双肩包 18L" [ref=e171]
+          - generic [ref=e172]:
+            - generic [ref=e173]:
+              - generic [ref=e175]: 箱包服饰
+              - generic [ref=e176]: score 0.79
+            - heading "轻量商务双肩包 18L" [level=3] [ref=e177]
+            - generic [ref=e180]: 快轨候选
+            - generic [ref=e181]:
+              - generic [ref=e182]: ¥329
+              - generic [ref=e183]: P99 < 25ms
+        - generic [ref=e184] [cursor=pointer]:
+          - generic [ref=e185]: "#9"
+          - img "猫抓板太空舱组合玩具" [ref=e187]
+          - generic [ref=e188]:
+            - generic [ref=e189]:
+              - generic [ref=e191]: 猫咪用品
+              - generic [ref=e192]: score 0.63
+            - heading "猫抓板太空舱组合玩具" [level=3] [ref=e193]
+            - generic [ref=e194]:
+              - generic [ref=e196]: 快轨候选
+              - generic [ref=e198]: 猫咪意图
+            - generic [ref=e199]:
+              - generic [ref=e200]: ¥159
+              - generic [ref=e201]: P99 < 25ms
+        - generic [ref=e202] [cursor=pointer]:
+          - generic [ref=e203]: "#10"
+          - img "桌面护眼氛围台灯" [ref=e205]
+          - generic [ref=e206]:
+            - generic [ref=e207]:
+              - generic [ref=e209]: 家居生活
+              - generic [ref=e210]: score 0.81
+            - heading "桌面护眼氛围台灯" [level=3] [ref=e211]
+            - generic [ref=e214]: 快轨候选
+            - generic [ref=e215]:
+              - generic [ref=e216]: ¥269
+              - generic [ref=e217]: P99 < 25ms
+        - generic [ref=e218] [cursor=pointer]:
+          - generic [ref=e219]: "#11"
+          - img "低敏无谷成猫主粮 5kg" [ref=e221]
+          - generic [ref=e222]:
+            - generic [ref=e223]:
+              - generic [ref=e225]: 猫咪用品
+              - generic [ref=e226]: score 0.68
+            - heading "低敏无谷成猫主粮 5kg" [level=3] [ref=e227]
+            - generic [ref=e228]:
+              - generic [ref=e230]: 快轨候选
+              - generic [ref=e232]: 猫咪意图
+            - generic [ref=e233]:
+              - generic [ref=e234]: ¥299
+              - generic [ref=e235]: P99 < 25ms
+        - generic [ref=e236] [cursor=pointer]:
+          - generic [ref=e237]: "#12"
+          - img "AI 健康运动手表" [ref=e239]
+          - generic [ref=e240]:
+            - generic [ref=e241]:
+              - generic [ref=e243]: 智能穿戴
+              - generic [ref=e244]: score 0.88
+            - heading "AI 健康运动手表" [level=3] [ref=e245]
+            - generic [ref=e248]: 快轨候选
+            - generic [ref=e249]:
+              - generic [ref=e250]: ¥1,299
+              - generic [ref=e251]: P99 < 25ms
+    - generic [ref=e253]:
+      - generic [ref=e254]:
+        - generic [ref=e255]:
+          - paragraph [ref=e256]: Developer Mode
+          - heading "慢轨 LLM 推理链路" [level=3] [ref=e257]
+        - button "收起" [ref=e258] [cursor=pointer]:
+          - generic [ref=e259]: 收起
+      - generic [ref=e260]:
+        - generic [ref=e261]:
+          - generic [ref=e263]: idle
+          - generic [ref=e264]: 等待事件
+        - generic [ref=e266]: $ 等待用户点击商品，慢轨将异步泵送行为事件...
+        - generic [ref=e267]:
+          - generic [ref=e268]: 行为泵送
+          - generic [ref=e269]: LLM意图解构
+          - generic [ref=e270]: 向量化降维
+          - generic [ref=e271]: Redis状态同步回写

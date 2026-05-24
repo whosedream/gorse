@@ -1,0 +1,1 @@
+- [Frontend Dashboard Setup](frontend-dashboard-setup.md) — Vite Vue TS Vuetify demo uses contracts-first mock rerank flow.

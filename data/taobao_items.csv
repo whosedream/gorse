@@ -1,0 +1,51 @@
+item_id,title,category,price,image_url
+cat_001,天然有机猫薄荷逗猫棒羽毛款,猫咪用品,19.90,https://img.alicdn.com/cat/catnip001.jpg
+cat_002,智能自动循环逗猫球USB充电,猫咪用品,49.90,https://img.alicdn.com/cat/ball001.jpg
+cat_003,全封闭式超大猫砂盆防溅防臭带铲,猫咪用品,89.00,https://img.alicdn.com/cat/litterbox001.jpg
+cat_004,猫咪太空舱双肩包外出便携透气,猫咪用品,129.00,https://img.alicdn.com/cat/backpack001.jpg
+cat_005,冻干猫零食鸡肉三文鱼混合500g,猫咪用品,39.90,https://img.alicdn.com/cat/treat001.jpg
+cat_006,剑麻猫抓板猫窝一体耐磨L码,猫咪用品,59.00,https://img.alicdn.com/cat/scratcher001.jpg
+cat_007,可调节高度陶瓷猫咪食盆双碗,猫咪用品,45.00,https://img.alicdn.com/cat/bowl001.jpg
+cat_008,猫用指甲剪LED照明不伤血线,猫咪用品,25.90,https://img.alicdn.com/cat/nail001.jpg
+cat_009,静音宠物电推剪猫咪剃毛器,猫咪用品,69.00,https://img.alicdn.com/cat/clipper001.jpg
+cat_010,猫爬架实木通天柱带吊床跳台,猫咪用品,298.00,https://img.alicdn.com/cat/tree001.jpg
+phone_001,华为Mate 70 Pro昆仑玻璃512GB,手机数码,6999.00,https://img.alicdn.com/phone/huawei001.jpg
+phone_002,小米15 Ultra徕卡影像16+512G,手机数码,6499.00,https://img.alicdn.com/phone/xiaomi001.jpg
+phone_003,OPPO Find X7 Ultra卫星通信版,手机数码,5999.00,https://img.alicdn.com/phone/oppo001.jpg
+phone_004,vivo X200 Pro蔡司超级长焦,手机数码,5299.00,https://img.alicdn.com/phone/vivo001.jpg
+phone_005,荣耀Magic7至臻版骁龙8Gen4,手机数码,5699.00,https://img.alicdn.com/phone/honor001.jpg
+phone_006,三星Galaxy S25 Ultra钛金属,手机数码,8999.00,https://img.alicdn.com/phone/samsung001.jpg
+phone_007,Apple AirPods Pro第三代主动降噪,手机数码,1799.00,https://img.alicdn.com/phone/airpods001.jpg
+phone_008,华为FreeBuds Pro 4星闪连接,手机数码,1299.00,https://img.alicdn.com/phone/huaweibuds001.jpg
+phone_009,Anker氮化镓65W三口快充头,手机数码,99.00,https://img.alicdn.com/phone/anker001.jpg
+phone_010,小米平板7 Pro 12.4英寸3K屏,手机数码,2899.00,https://img.alicdn.com/phone/mipad001.jpg
+sport_001,李宁超轻20代碳板跑鞋男款,运动户外,399.00,https://img.alicdn.com/sport/shoe001.jpg
+sport_002,安踏C37 3.0软底缓震跑鞋,运动户外,349.00,https://img.alicdn.com/sport/anta001.jpg
+sport_003,Keep智能计数跳绳蓝牙APP同步,运动户外,79.00,https://img.alicdn.com/sport/rope001.jpg
+sport_004,骆驼户外登山包40L防水透气,运动户外,199.00,https://img.alicdn.com/sport/bag001.jpg
+sport_005,探路者三合一冲锋衣防风保暖,运动户外,599.00,https://img.alicdn.com/sport/jacket001.jpg
+sport_006,迪卡侬速干T恤运动跑步男女款,运动户外,59.90,https://img.alicdn.com/sport/tshirt001.jpg
+sport_007,牧高笛帐篷3-4人自动速开防晒,运动户外,459.00,https://img.alicdn.com/sport/tent001.jpg
+sport_008,野行户外折叠椅铝合金超轻便携,运动户外,89.00,https://img.alicdn.com/sport/chair001.jpg
+sport_009,小米筋膜枪Pro深层肌肉放松,运动户外,329.00,https://img.alicdn.com/sport/gun001.jpg
+sport_010,鸿星尔克篮球鞋凌云2.0实战款,运动户外,269.00,https://img.alicdn.com/sport/basketball001.jpg
+book_001,深入理解计算机系统原书第3版,图书,99.00,https://img.alicdn.com/book/csapp001.jpg
+book_002,Go语言高级编程源码级剖析,图书,79.00,https://img.alicdn.com/book/goadv001.jpg
+book_003,数据库系统内幕分布式存储设计,图书,89.00,https://img.alicdn.com/book/db001.jpg
+book_004,人月神话软件工程经典40周年纪念,图书,49.00,https://img.alicdn.com/book/mmm001.jpg
+book_005,重构改善既有代码的设计第2版,图书,69.00,https://img.alicdn.com/book/refactor001.jpg
+book_006,数据密集型应用系统设计DDIA,图书,119.00,https://img.alicdn.com/book/ddia001.jpg
+book_007,动手学深度学习PyTorch版,图书,89.00,https://img.alicdn.com/book/d2l001.jpg
+book_008,系统性能调优实战指南,图书,69.00,https://img.alicdn.com/book/perf001.jpg
+book_009,大语言模型原理与工程实践,图书,99.00,https://img.alicdn.com/book/llm001.jpg
+book_010,程序员面试金典第6版,图书,59.00,https://img.alicdn.com/book/crack001.jpg
+coffee_001,隅田川进口意式浓缩挂耳黑咖啡24片,咖啡茶饮,39.90,https://img.alicdn.com/coffee/sumi001.jpg
+coffee_002,瑞幸精品冻干即溶咖啡粉12颗装,咖啡茶饮,49.90,https://img.alicdn.com/coffee/luckin001.jpg
+coffee_003,星巴克佛罗娜研磨咖啡粉250g,咖啡茶饮,69.00,https://img.alicdn.com/coffee/starbucks001.jpg
+coffee_004,三顿半精品速溶咖啡冷萃冻干24颗,咖啡茶饮,89.00,https://img.alicdn.com/coffee/saturn001.jpg
+coffee_005,永璞闪萃浓缩咖啡液0糖0脂18杯,咖啡茶饮,79.00,https://img.alicdn.com/coffee/yp001.jpg
+coffee_006,金骏眉红茶特级武夷山桐木关50g,咖啡茶饮,59.00,https://img.alicdn.com/coffee/jjm001.jpg
+coffee_007,西湖龙井明前特级绿茶100g礼盒,咖啡茶饮,129.00,https://img.alicdn.com/coffee/longjing001.jpg
+coffee_008,安溪铁观音浓香型乌龙茶250g,咖啡茶饮,49.90,https://img.alicdn.com/coffee/tgy001.jpg
+coffee_009,奈雪的茶一周好茶混合装7包,咖啡茶饮,39.00,https://img.alicdn.com/coffee/naixue001.jpg
+coffee_010,手冲咖啡壶套装温控细嘴壶600ml,咖啡茶饮,169.00,https://img.alicdn.com/coffee/kettle001.jpg

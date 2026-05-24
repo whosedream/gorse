@@ -1,0 +1,7 @@
+{
+  "tool_name": "PowerShell",
+  "tool_input_preview": "{\"command\":\"$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*D:\\\\CodeField\\\\Go-Rec\\\\frontend*' -or $_.CommandLine -like '*vite --host 127.0.0.1*' -or $_.CommandLine -like...",
+  "error": "Exit code 255",
+  "timestamp": "2026-05-24T17:09:28.849Z",
+  "retry_count": 1
+}

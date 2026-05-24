@@ -1,0 +1,468 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1779649024686,
+  "projectRoot": "D:\\CodeField\\Go-Rec",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Go",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "go.mod"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "go",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "test"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "api": {
+      "path": "api",
+      "purpose": "API routes",
+      "fileCount": 2,
+      "lastAccessed": 1779649024673,
+      "keyFiles": [
+        "handler.go",
+        "handler_test.go"
+      ]
+    },
+    "artifacts": {
+      "path": "artifacts",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1779649024674,
+      "keyFiles": [
+        "anti_drift_acceptance_report.md",
+        "cache_scorer_review_report.md",
+        "fsm_acceptance_report.md",
+        "pool_acceptance_report.md"
+      ]
+    },
+    "cmd": {
+      "path": "cmd",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1779649024674,
+      "keyFiles": []
+    },
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 3,
+      "lastAccessed": 1779649024674,
+      "keyFiles": [
+        "ratings_Electronics.csv",
+        "taobao_items.csv",
+        "UserBehavior.csv"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 2,
+      "lastAccessed": 1779649024675,
+      "keyFiles": [
+        "design_sdd.md",
+        "project_overview.md"
+      ]
+    },
+    "frontend": {
+      "path": "frontend",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1779649024675,
+      "keyFiles": [
+        "eslint.config.js",
+        "index.html",
+        "package-lock.json",
+        "package.json",
+        "tsconfig.json"
+      ]
+    },
+    "internal": {
+      "path": "internal",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1779649024675,
+      "keyFiles": []
+    },
+    "pkg": {
+      "path": "pkg",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1779649024675,
+      "keyFiles": []
+    },
+    "test": {
+      "path": "test",
+      "purpose": "Test files",
+      "fileCount": 0,
+      "lastAccessed": 1779649024675,
+      "keyFiles": []
+    },
+    "frontend\\dist": {
+      "path": "frontend\\dist",
+      "purpose": "Distribution/build output",
+      "fileCount": 1,
+      "lastAccessed": 1779649024676,
+      "keyFiles": [
+        "index.html"
+      ]
+    },
+    "frontend\\docs": {
+      "path": "frontend\\docs",
+      "purpose": "Documentation",
+      "fileCount": 1,
+      "lastAccessed": 1779649024676,
+      "keyFiles": [
+        "component-contracts.md"
+      ]
+    },
+    "frontend\\node_modules": {
+      "path": "frontend\\node_modules",
+      "purpose": "Dependencies",
+      "fileCount": 1,
+      "lastAccessed": 1779649024677,
+      "keyFiles": []
+    },
+    "frontend\\src": {
+      "path": "frontend\\src",
+      "purpose": "Source code",
+      "fileCount": 4,
+      "lastAccessed": 1779649024677,
+      "keyFiles": [
+        "App.vue",
+        "main.ts",
+        "style.css"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "",
+      "accessCount": 85,
+      "lastAccessed": 1779649163967,
+      "type": "directory"
+    },
+    {
+      "path": "pkg\\fsm\\parser.go",
+      "accessCount": 62,
+      "lastAccessed": 1779645256411,
+      "type": "file"
+    },
+    {
+      "path": "api\\handler.go",
+      "accessCount": 51,
+      "lastAccessed": 1779649142520,
+      "type": "file"
+    },
+    {
+      "path": "cmd\\server\\main.go",
+      "accessCount": 48,
+      "lastAccessed": 1779647957589,
+      "type": "file"
+    },
+    {
+      "path": "internal\\rk\\anti_drift\\coordinator.go",
+      "accessCount": 33,
+      "lastAccessed": 1779554178919,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\pool\\goroutine.go",
+      "accessCount": 33,
+      "lastAccessed": 1779630147945,
+      "type": "file"
+    },
+    {
+      "path": "api\\handler_test.go",
+      "accessCount": 33,
+      "lastAccessed": 1779649163596,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\cache\\client.go",
+      "accessCount": 32,
+      "lastAccessed": 1779645249311,
+      "type": "file"
+    },
+    {
+      "path": "go.mod",
+      "accessCount": 32,
+      "lastAccessed": 1779646412376,
+      "type": "file"
+    },
+    {
+      "path": "internal\\rk\\anti_drift\\coordinator_test.go",
+      "accessCount": 27,
+      "lastAccessed": 1779560684104,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 25,
+      "lastAccessed": 1779644091345,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\fsm\\parser_test.go",
+      "accessCount": 20,
+      "lastAccessed": 1779554196962,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\cache\\client_test.go",
+      "accessCount": 19,
+      "lastAccessed": 1779611953622,
+      "type": "file"
+    },
+    {
+      "path": "internal\\rk\\scorer\\engine.go",
+      "accessCount": 18,
+      "lastAccessed": 1779645242609,
+      "type": "file"
+    },
+    {
+      "path": "internal\\rk\\scorer\\pipeline_bench_test.go",
+      "accessCount": 17,
+      "lastAccessed": 1779547174397,
+      "type": "file"
+    },
+    {
+      "path": "docs\\design_sdd.md",
+      "accessCount": 17,
+      "lastAccessed": 1779560679415,
+      "type": "file"
+    },
+    {
+      "path": "test\\loadtest\\runner.go",
+      "accessCount": 16,
+      "lastAccessed": 1779629151052,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\pool\\memory.go",
+      "accessCount": 16,
+      "lastAccessed": 1779630147881,
+      "type": "file"
+    },
+    {
+      "path": "internal\\rk\\anti_drift\\coordinator_bench_test.go",
+      "accessCount": 13,
+      "lastAccessed": 1779533241058,
+      "type": "file"
+    },
+    {
+      "path": "internal\\slow_track\\llm_test.go",
+      "accessCount": 12,
+      "lastAccessed": 1779616303440,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\fsm\\parser_bench_test.go",
+      "accessCount": 11,
+      "lastAccessed": 1779528843094,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\pool\\goroutine_test.go",
+      "accessCount": 11,
+      "lastAccessed": 1779560684039,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\fsm",
+      "accessCount": 10,
+      "lastAccessed": 1779611569846,
+      "type": "directory"
+    },
+    {
+      "path": "internal\\rk\\scorer\\engine_test.go",
+      "accessCount": 9,
+      "lastAccessed": 1779554197211,
+      "type": "file"
+    },
+    {
+      "path": "test\\loadtest\\runner_test.go",
+      "accessCount": 9,
+      "lastAccessed": 1779558087570,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\pool\\memory_test.go",
+      "accessCount": 8,
+      "lastAccessed": 1779603986649,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\agent\\dag_test.go",
+      "accessCount": 6,
+      "lastAccessed": 1779629171493,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\pool\\pool_bench_test.go",
+      "accessCount": 5,
+      "lastAccessed": 1779526974197,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\pool",
+      "accessCount": 4,
+      "lastAccessed": 1779531648585,
+      "type": "directory"
+    },
+    {
+      "path": "internal\\rk\\anti_drift",
+      "accessCount": 3,
+      "lastAccessed": 1779533363442,
+      "type": "directory"
+    },
+    {
+      "path": "artifacts\\pool_acceptance_report.md",
+      "accessCount": 3,
+      "lastAccessed": 1779539002805,
+      "type": "file"
+    },
+    {
+      "path": "docs\\superpowers\\plans\\2026-05-24-gateway-streaming-loadtest.md",
+      "accessCount": 3,
+      "lastAccessed": 1779595848610,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hzj\\.claude\\projects\\D--CodeField-Go-Rec\\8ac37758-e955-4202-a21b-2a4c1c2c7f00\\tool-results\\btx6tq3ym.txt",
+      "accessCount": 2,
+      "lastAccessed": 1779532054372,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hzj\\AppData\\Local\\Temp\\claude\\D--CodeField-Go-Rec\\42105f0c-3606-4b56-93c0-ae3fcd357581\\tasks\\ba07n4oqu.output",
+      "accessCount": 2,
+      "lastAccessed": 1779546480186,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hzj\\.claude\\projects\\D--CodeField-Go-Rec\\8ac37758-e955-4202-a21b-2a4c1c2c7f00\\tool-results\\b788d0fbu.txt",
+      "accessCount": 2,
+      "lastAccessed": 1779555244412,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hzj\\.claude\\projects\\D--CodeField-Go-Rec\\8ac37758-e955-4202-a21b-2a4c1c2c7f00\\tool-results\\b831a0fz7.txt",
+      "accessCount": 2,
+      "lastAccessed": 1779558048238,
+      "type": "file"
+    },
+    {
+      "path": "pkg\\mq\\consumer_test.go",
+      "accessCount": 2,
+      "lastAccessed": 1779611012299,
+      "type": "file"
+    },
+    {
+      "path": "pkg",
+      "accessCount": 1,
+      "lastAccessed": 1779527027806,
+      "type": "directory"
+    },
+    {
+      "path": "artifacts\\fsm_acceptance_report.md",
+      "accessCount": 1,
+      "lastAccessed": 1779539086214,
+      "type": "file"
+    },
+    {
+      "path": "artifacts\\anti_drift_acceptance_report.md",
+      "accessCount": 1,
+      "lastAccessed": 1779539087458,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Program Files",
+      "accessCount": 1,
+      "lastAccessed": 1779544486968,
+      "type": "directory"
+    },
+    {
+      "path": "C:\\Users\\hzj",
+      "accessCount": 1,
+      "lastAccessed": 1779544501571,
+      "type": "directory"
+    },
+    {
+      "path": "C:\\Users\\hzj\\AppData\\Local\\Temp\\claude\\D--CodeField-Go-Rec\\42105f0c-3606-4b56-93c0-ae3fcd357581\\tasks\\bzjc9q6yg.output",
+      "accessCount": 1,
+      "lastAccessed": 1779545697730,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hzj\\AppData\\Local\\Temp\\claude\\D--CodeField-Go-Rec\\42105f0c-3606-4b56-93c0-ae3fcd357581\\tasks\\bvztclbqy.output",
+      "accessCount": 1,
+      "lastAccessed": 1779545995798,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hzj\\AppData\\Local\\Temp\\claude\\D--CodeField-Go-Rec\\42105f0c-3606-4b56-93c0-ae3fcd357581\\tasks\\b6wq8xj9a.output",
+      "accessCount": 1,
+      "lastAccessed": 1779546614534,
+      "type": "file"
+    },
+    {
+      "path": "artifacts\\cache_scorer_review_report.md",
+      "accessCount": 1,
+      "lastAccessed": 1779553167524,
+      "type": "file"
+    },
+    {
+      "path": "api",
+      "accessCount": 1,
+      "lastAccessed": 1779555335753,
+      "type": "directory"
+    },
+    {
+      "path": "docs\\superpowers\\specs\\2026-05-24-gateway-streaming-loadtest-design.md",
+      "accessCount": 1,
+      "lastAccessed": 1779557700118,
+      "type": "file"
+    },
+    {
+      "path": "data\\ratings_Electronics.csv",
+      "accessCount": 1,
+      "lastAccessed": 1779557854211,
+      "type": "file"
+    },
+    {
+      "path": "data\\UserBehavior.csv",
+      "accessCount": 1,
+      "lastAccessed": 1779557857621,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

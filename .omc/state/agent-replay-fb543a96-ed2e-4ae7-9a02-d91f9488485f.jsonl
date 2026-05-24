@@ -1,0 +1,5 @@
+{"t":0,"agent":"system","event":"keyword_detected","keyword":"tdd"}
+{"t":0,"agent":"system","event":"skill_invoked","skill_name":"superpowers:test-driven-development"}
+{"t":0,"agent":"system","event":"skill_invoked","skill_name":"superpowers:subagent-driven-development"}
+{"t":0,"agent":"system","event":"skill_invoked","skill_name":"superpowers:using-git-worktrees"}
+{"t":0,"agent":"system","event":"skill_invoked","skill_name":"oh-my-claudecode:omc-reference"}

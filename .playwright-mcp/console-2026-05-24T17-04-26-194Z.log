@@ -1,0 +1,2 @@
+[     558ms] [ERROR] Failed to load resource: the server responded with a status of 504 (Outdated Optimize Dep) @ http://127.0.0.1:5173/node_modules/.vite/deps/@formkit_auto-animate_vue.js?v=eca3ab27:0
+[     879ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:5173/favicon.ico:0

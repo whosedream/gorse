@@ -5,8 +5,8 @@
         <p class="eyebrow">Fast Track Ranking Surface</p>
         <h2>电商商品瀑布流重排</h2>
       </div>
-      <v-chip :color="isReranked ? 'accent' : 'primary'" variant="tonal">
-        {{ isReranked ? 'Set B: 猫咪意图重排' : 'Set A: 基线排序' }}
+      <v-chip :color="rerankMode === 'ai-hit' ? 'accent' : 'primary'" variant="tonal">
+        {{ rerankMode === 'ai-hit' ? 'AI 深度意图重排 (Hit)' : rerankMode === 'fallback' ? '基线基础召回 (Fallback)' : 'Set A: 基线排序' }}
       </v-chip>
     </div>
 
@@ -31,13 +31,13 @@
 <script setup lang="ts">
 import { vAutoAnimate } from '@formkit/auto-animate/vue'
 import ProductCard from './ProductCard.vue'
-import type { ProductItem } from '../types/product'
+import type { ProductItem, RerankMode } from '../types/product'
 
 defineProps<{
   products: ProductItem[]
   selectedId: string | null
   busy: boolean
-  isReranked: boolean
+  rerankMode: RerankMode
 }>()
 
 const emit = defineEmits<{

@@ -118,8 +118,12 @@ function withRanks(products: ProductItem[]): ProductItem[] {
   return products.map((product, index) => ({ ...product, rank: index + 1 }))
 }
 
-export function getBaselineProducts(): ProductItem[] {
+export function getProductCatalog(): ProductItem[] {
   return withRanks(baseProducts)
+}
+
+export function getBaselineProducts(): ProductItem[] {
+  return getProductCatalog()
 }
 
 export function getCatIntentRerankedProducts(): ProductItem[] {

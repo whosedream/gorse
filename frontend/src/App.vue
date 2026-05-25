@@ -6,7 +6,7 @@
           <p class="eyebrow">Go-Rec Dual Track Reranking</p>
           <h1>快轨不降速，慢轨懂意图</h1>
           <p class="subtitle">
-            点击任意猫咪商品后，慢轨模拟 DeepSeek 推理并回写热特征缓存；日志结束后切换 Set A -> Set B，商品网格自动重排。
+            点击任意商品后，慢轨模拟 DeepSeek 推理并回写热特征缓存；左侧快轨调用真实 /rerank API，商品网格按后端结果自动重排。
           </p>
         </div>
         <div class="metric-row">
@@ -28,7 +28,7 @@
             :products="products"
             :selected-id="selectedId"
             :busy="isBusy"
-            :is-reranked="isReranked"
+            :rerank-mode="rerankMode"
             @select="handleProductSelect"
           />
         </v-col>
@@ -36,6 +36,7 @@
         <v-col cols="12" lg="4" xl="3">
           <SlowTrackConsole
             :run-id="runId"
+            :session-id="sessionId"
             :status="status"
             :collapsed="consoleCollapsed"
             @complete="handleConsoleComplete"
@@ -49,64 +50,119 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, ref } from 'vue'
 import ProductGrid from './components/ProductGrid.vue'
 import SlowTrackConsole from './components/SlowTrackConsole.vue'
-import { getBaselineProducts, getCatIntentRerankedProducts } from './mock/products'
-import type { ProductItem, RerankStatus } from './types/product'
+import { getProductCatalog } from './mock/products'
+import type { ProductItem, RerankMode, RerankResponse, RerankStatus } from './types/product'
 
 const phaseLabels = ['行为泵送', 'LLM意图解构', '向量化降维', 'Redis状态同步回写']
 
-const products = ref<ProductItem[]>(getBaselineProducts())
+const catalog = getProductCatalog()
+const products = ref<ProductItem[]>(catalog)
 const selectedId = ref<string | null>(null)
 const status = ref<RerankStatus>('idle')
 const runId = ref(0)
-const isReranked = ref(false)
+const rerankMode = ref<RerankMode>('baseline')
 const consoleCollapsed = ref(false)
 const activePhase = ref(-1)
-let rerankTimeoutId: number | undefined
+const storedSessionId = window.localStorage.getItem('go-rec-session-id')
+const sessionId = storedSessionId && experimentBucket(storedSessionId) >= 50 ? storedSessionId : createExperimentSessionId()
+
+window.localStorage.setItem('go-rec-session-id', sessionId)
 
 const isBusy = computed(() => ['streaming', 'inferring', 'reranking'].includes(status.value))
+const isReranked = computed(() => rerankMode.value !== 'baseline')
 const activePhaseLabel = computed(() => (activePhase.value >= 0 ? phaseLabels[activePhase.value] : 'Idle'))
 
-function clearRerankTimeout(): void {
-  if (rerankTimeoutId !== undefined) {
-    window.clearTimeout(rerankTimeoutId)
-    rerankTimeoutId = undefined
+function experimentBucket(value: string): number {
+  let h = 2166136261
+  for (let i = 0; i < value.length; i += 1) {
+    h ^= value.charCodeAt(i)
+    h = Math.imul(h, 16777619) >>> 0
+  }
+  return h % 100
+}
+
+function createExperimentSessionId(): string {
+  for (let i = 0; i < 32; i += 1) {
+    const candidate = window.crypto.randomUUID()
+    if (experimentBucket(candidate) >= 50) {
+      return candidate
+    }
+  }
+  return '00000000-0000-4000-8000-000000000003'
+}
+
+function productForResult(result: RerankResponse['results'][number], index: number): ProductItem {
+  const backendId = String(result.id)
+  const metadata = catalog.find((product) => product.item_id === backendId) ?? catalog[index % catalog.length]
+  return {
+    ...metadata,
+    item_id: backendId,
+    title: metadata ? `${metadata.title} · #${backendId}` : `Backend Result #${backendId}`,
+    score: result.score,
+    rank: index + 1,
   }
 }
 
-function handleProductSelect(product: ProductItem): void {
+function applyRerankResults(response: RerankResponse): void {
+  if (response.results.length === 0) {
+    return
+  }
+
+  const orderedProducts = response.results.map((result, index) => productForResult(result, index))
+
+  if (orderedProducts.length > 0) {
+    products.value = orderedProducts
+  }
+  rerankMode.value = response.fallback || !response.intent_hit ? 'fallback' : 'ai-hit'
+}
+
+async function handleProductSelect(product: ProductItem): Promise<void> {
   if (isBusy.value) {
     return
   }
 
   selectedId.value = product.item_id
   status.value = 'streaming'
-  isReranked.value = false
-  products.value = getBaselineProducts()
+  rerankMode.value = 'baseline'
+  products.value = catalog
   activePhase.value = 0
   runId.value += 1
+
+  try {
+    status.value = 'reranking'
+    const response = await window.fetch('http://127.0.0.1:18080/rerank', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sessionId,
+        version_stamp: Date.now(),
+        item_id: product.item_id,
+        slots: {
+          category: product.category,
+          brand: product.brand ?? 'default',
+        },
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Rerank request failed: ${response.status}`)
+    }
+
+    applyRerankResults((await response.json()) as RerankResponse)
+  } catch (error) {
+    console.error('Failed to fetch rerank results', error)
+    status.value = 'idle'
+    activePhase.value = -1
+  }
 }
 
 function handleConsoleComplete(): void {
-  status.value = 'inferring'
-  clearRerankTimeout()
-  rerankTimeoutId = window.setTimeout(() => {
-    status.value = 'reranking'
-    products.value = getCatIntentRerankedProducts()
-    isReranked.value = true
-
-    window.setTimeout(() => {
-      status.value = 'complete'
-      activePhase.value = 3
-    }, 520)
-  }, 460)
+  status.value = 'complete'
+  activePhase.value = 3
 }
-
-onBeforeUnmount(() => {
-  clearRerankTimeout()
-})
 </script>
 
 <style scoped>

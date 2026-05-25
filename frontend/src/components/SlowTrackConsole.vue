@@ -30,10 +30,6 @@
             <span class="prompt">go-rec@slow-track</span>
             <span>{{ line }}</span>
           </div>
-          <div v-if="streamingText" class="log-line active">
-            <span class="prompt">go-rec@slow-track</span>
-            <span>{{ streamingText }}</span><span class="cursor" />
-          </div>
         </div>
 
         <div class="phase-grid">
@@ -52,11 +48,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { RerankStatus } from '../types/product'
 
 const props = defineProps<{
   runId: number
+  sessionId: string
   status: RerankStatus
   collapsed: boolean
 }>()
@@ -68,24 +65,10 @@ const emit = defineEmits<{
 }>()
 
 const phases = ['行为泵送', 'LLM意图解构', '向量化降维', 'Redis状态同步回写']
-const script = [
-  '[行为泵送] 发现连击行为：用户连续命中猫粮、猫砂、饮水机候选卡片...',
-  '[行为泵送] 抽取多轮会话上下文：最近 7 次曝光 / 3 次点击 / 1 次收藏...',
-  '[LLM意图解构] 正在唤醒 DeepSeek 意图推理链路，构造慢轨 Prompt DAG...',
-  '[LLM意图解构] 意图锁定：猫咪用品 / 主粮 / 高转化偏好 / 价格敏感度中等...',
-  '[向量化降维] 开始降维生成在线特征向量：cat_food=0.97, litter=0.86, toy=0.61...',
-  '[向量化降维] 计算防感知漂移：delta=2.4%，低于 5% 安全阈值...',
-  '[Redis状态同步回写] 写入快轨热特征缓存 user:intent:demo:cat@v2...',
-  '[Redis状态同步回写] 触发重排：提升命中猫咪意图商品权重，准备 Set B...',
-]
-
 const lines = ref<string[]>([])
-const streamingText = ref('')
 const activePhase = ref(-1)
 const consoleBody = ref<HTMLElement | null>(null)
-let intervalId: number | undefined
-let lineIndex = 0
-let charIndex = 0
+let eventSource: InstanceType<typeof window.EventSource> | undefined
 
 const statusText = computed(() => {
   const mapping: Record<RerankStatus, string> = {
@@ -110,15 +93,11 @@ const activePhaseLabel = computed(() => {
   return phases[Math.min(activePhase.value, phases.length - 1)]
 })
 
-function phaseForLine(index: number): number {
-  return Math.min(Math.floor(index / 2), phases.length - 1)
-}
-
-function clearTimer(): void {
-  if (intervalId !== undefined) {
-    window.clearInterval(intervalId)
-    intervalId = undefined
-  }
+function phaseForLine(line: string): number {
+  if (line.includes('[LLM推理开始]') || line.includes('[反思触发]') || line.includes('[LLM推理完成]')) return 1
+  if (line.includes('[向量生成]')) return 2
+  if (line.includes('[Redis写入成功]')) return 3
+  return 0
 }
 
 async function scrollToBottom(): Promise<void> {
@@ -128,51 +107,52 @@ async function scrollToBottom(): Promise<void> {
   }
 }
 
-function startStreaming(): void {
-  clearTimer()
-  lines.value = []
-  streamingText.value = ''
-  activePhase.value = 0
-  emit('phase', 0)
-  lineIndex = 0
-  charIndex = 0
+function closeStream(): void {
+  if (eventSource) {
+    eventSource.close()
+    eventSource = undefined
+  }
+}
 
-  intervalId = window.setInterval(() => {
-    const currentLine = script[lineIndex]
-    if (!currentLine) {
-      clearTimer()
-      streamingText.value = ''
+function openStream(): void {
+  closeStream()
+  if (!props.sessionId) return
+  eventSource = new window.EventSource(`http://127.0.0.1:18080/stream?session_id=${encodeURIComponent(props.sessionId)}`)
+  eventSource.onmessage = (event) => {
+    const line = event.data
+    lines.value.push(line)
+    const phase = phaseForLine(line)
+    if (phase > activePhase.value) {
+      activePhase.value = phase
+      emit('phase', phase)
+    }
+    if (line.includes('[Redis写入成功]')) {
       emit('complete')
-      return
     }
-
-    activePhase.value = phaseForLine(lineIndex)
-    emit('phase', activePhase.value)
-    streamingText.value = currentLine.slice(0, charIndex + 1)
-    charIndex += 2
-
-    if (charIndex >= currentLine.length) {
-      lines.value.push(currentLine)
-      streamingText.value = ''
-      lineIndex += 1
-      charIndex = 0
-    }
-
     void scrollToBottom()
-  }, 28)
+  }
 }
 
 watch(
   () => props.runId,
   (runId) => {
     if (runId > 0) {
-      startStreaming()
+      lines.value = []
+      activePhase.value = 0
+      emit('phase', 0)
     }
   },
 )
 
+watch(
+  () => props.sessionId,
+  () => openStream(),
+)
+
+onMounted(() => openStream())
+
 onBeforeUnmount(() => {
-  clearTimer()
+  closeStream()
 })
 </script>
 

@@ -90,6 +90,85 @@ func TestPromptBuilderHandlesEmptyAndMaliciousInput(t *testing.T) {
 	}
 }
 
+func TestPromptBuilderAddsReflectionInstructionOnIntentReversal(t *testing.T) {
+	t.Parallel()
+
+	previous := strings.Repeat("母婴", 100) + "尾巴"
+	st := &State{
+		SessionID: "s-reflect",
+		Metadata: map[string]string{
+			"previous_intent_text": previous,
+		},
+		Events: []mq.Event{
+			{UserID: "u1", ItemID: "phone-1", CategoryID: "数码", Timestamp: 10, Action: "click"},
+			{UserID: "u1", ItemID: "phone-2", CategoryID: "数码", Timestamp: 20, Action: "click"},
+		},
+	}
+
+	prompt, err := DefaultPromptBuilder().Build(st)
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		"<reflection_instruction>",
+		"【系统反思指令】",
+		"最新连续点击",
+		"item=phone-1 category=数码",
+		"item=phone-2 category=数码",
+		"最终 JSON 结构、字段名、字段类型必须与 output_schema 100% 一致。",
+		"仅输出最终的 JSON 字符串，严禁包含任何解释性文本、道歉用语或自然语言回复。",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("reflection prompt missing %q: %s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "尾巴") {
+		t.Fatalf("reflection prompt did not truncate previous intent with rune boundary: %s", prompt)
+	}
+	if !strings.Contains(prompt, "母婴") {
+		t.Fatalf("reflection prompt lost complete Chinese runes: %s", prompt)
+	}
+	if got := st.Metadata["reflection_active"]; got != "true" {
+		t.Fatalf("reflection_active metadata = %q, want true", got)
+	}
+}
+
+func TestPromptBuilderReflectsWhenPreviousIntentMentionsNewCategoryAsRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		previous string
+	}{
+		{name: "adjacent negation", previous: "旧意图：母婴；用户不再关注数码"},
+		{name: "punctuated negation", previous: "旧意图：母婴；用户不再关注：数码"},
+		{name: "spaced negation", previous: "旧意图：母婴；用户不再关注 数码"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st := &State{
+				SessionID: "s-reflect-negated",
+				Metadata: map[string]string{
+					MetadataPreviousIntentText: tt.previous,
+				},
+				Events: []mq.Event{
+					{UserID: "u1", ItemID: "phone-9", CategoryID: "数码", Timestamp: 30, Action: "click"},
+				},
+			}
+			prompt, err := DefaultPromptBuilder().Build(st)
+			if err != nil {
+				t.Fatalf("Build returned error: %v", err)
+			}
+			if !strings.Contains(prompt, "<reflection_instruction>") {
+				t.Fatalf("prompt did not reflect after negated category mention: %s", prompt)
+			}
+		})
+	}
+}
+
 func TestCompactBehaviorLogFiltersSortsAndLimits(t *testing.T) {
 	t.Parallel()
 

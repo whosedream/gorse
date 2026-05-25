@@ -1,1 +1,15 @@
 .env
+
+# Go build/test artifacts
+*.exe
+*.test
+*.out
+coverage.out
+
+# Frontend dependencies/build output
+frontend/node_modules/
+frontend/dist/
+
+# Local automation/runtime artifacts
+.playwright-mcp/
+.omc/state/

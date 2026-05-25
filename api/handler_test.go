@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +22,25 @@ import (
 )
 
 const testSessionID = "123e4567-e89b-12d3-a456-426614174000"
+
+func TestServerCORSPreflightAllowsViteOrigin(t *testing.T) {
+	t.Parallel()
+	s := newTestServer(t, Options{CandidateIDs: []int64{1}, VectorDim: 2, MaxInFlight: 4, Timeout: 50 * time.Millisecond})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodOptions, "/rerank", nil)
+	req.Header.Set("Origin", "http://127.0.0.1:5173")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body=%q, want 204", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1:5173" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodPost) {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want POST", got)
+	}
+}
 
 func TestServer(t *testing.T) {
 	t.Parallel()
@@ -124,6 +144,7 @@ func TestServer(t *testing.T) {
 
 func TestServerIntentReader(t *testing.T) {
 	t.Parallel()
+	session := findSessionForExperiment(t, true)
 
 	t.Run("reader vector changes sorting", func(t *testing.T) {
 		t.Parallel()
@@ -132,10 +153,10 @@ func TestServerIntentReader(t *testing.T) {
 			dst[1] = 10
 		}}
 		s := newTestServer(t, Options{CandidateIDs: []int64{1, 2}, VectorDim: 2, MaxInFlight: 8, Timeout: 50 * time.Millisecond, IntentReader: reader, IntentReadTimeout: 2 * time.Millisecond})
-		seedFastRecord(t, s.coordinator, testSessionID, 1, []float32{10, 0})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{10, 0})
 
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(testSessionID, 1)))
+		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(session, 1)))
 		s.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
@@ -143,6 +164,9 @@ func TestServerIntentReader(t *testing.T) {
 		body := rr.Body.String()
 		if !strings.Contains(body, `"results":[{"id":2`) {
 			t.Fatalf("reader intent did not move candidate 2 first: %s", body)
+		}
+		if !strings.Contains(body, `"intent_hit":true`) {
+			t.Fatalf("reader intent path did not expose intent_hit=true: %s", body)
 		}
 	})
 
@@ -153,11 +177,11 @@ func TestServerIntentReader(t *testing.T) {
 			dst[1] = 10
 		}}
 		s := newTestServer(t, Options{CandidateIDs: []int64{1, 2}, VectorDim: 2, MaxInFlight: 8, Timeout: 50 * time.Millisecond, IntentReader: reader, IntentReadTimeout: 2 * time.Millisecond})
-		seedFastRecord(t, s.coordinator, testSessionID, 1, []float32{10, 0})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{10, 0})
 
 		start := time.Now()
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(testSessionID, 1)))
+		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(session, 1)))
 		s.ServeHTTP(rr, req)
 		elapsed := time.Since(start)
 		if rr.Code != http.StatusOK {
@@ -166,8 +190,12 @@ func TestServerIntentReader(t *testing.T) {
 		if elapsed >= 30*time.Millisecond {
 			t.Fatalf("elapsed = %s, want bounded degradation under 30ms", elapsed)
 		}
-		if !strings.Contains(rr.Body.String(), `"results":[{"id":1`) {
-			t.Fatalf("timeout path did not fall back to coordinator intent: %s", rr.Body.String())
+		body := rr.Body.String()
+		if !strings.Contains(body, `"results":[{"id":1`) {
+			t.Fatalf("timeout path did not fall back to coordinator intent: %s", body)
+		}
+		if !strings.Contains(body, `"intent_hit":false`) {
+			t.Fatalf("timeout path did not expose intent_hit=false: %s", body)
 		}
 	})
 
@@ -186,9 +214,9 @@ func TestServerIntentReader(t *testing.T) {
 				dst[1] = 10
 			}}
 			s := newTestServer(t, Options{CandidateIDs: []int64{1, 2}, VectorDim: 2, MaxInFlight: 8, Timeout: 50 * time.Millisecond, IntentReader: reader, IntentReadTimeout: 2 * time.Millisecond})
-			seedFastRecord(t, s.coordinator, testSessionID, 1, []float32{10, 0})
+			seedFastRecord(t, s.coordinator, session, 1, []float32{10, 0})
 			rr := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(testSessionID, 1)))
+			req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(session, 1)))
 			s.ServeHTTP(rr, req)
 			if rr.Code != http.StatusOK {
 				t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
@@ -203,15 +231,205 @@ func TestServerIntentReader(t *testing.T) {
 		t.Parallel()
 		reader := &stubIntentReader{checkDeadline: true, minDeadline: time.Millisecond, maxDeadline: 20 * time.Millisecond}
 		s := newTestServer(t, Options{CandidateIDs: []int64{1, 2}, VectorDim: 2, MaxInFlight: 8, Timeout: 50 * time.Millisecond, IntentReader: reader, IntentReadTimeout: 2 * time.Millisecond})
-		seedFastRecord(t, s.coordinator, testSessionID, 1, []float32{10, 0})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{10, 0})
 		rr := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(testSessionID, 1)))
+		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(session, 1)))
 		s.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
 		}
 		if reader.deadlineErr.Load() != nil {
 			t.Fatalf("deadline check failed: %v", reader.deadlineErr.Load())
+		}
+	})
+}
+
+func TestExperimentBucketStableAndBounded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		session string
+	}{
+		{name: "canonical session", session: testSessionID},
+		{name: "zero session", session: "00000000-0000-4000-8000-000000000000"},
+		{name: "max hex session", session: "ffffffff-ffff-4fff-8fff-ffffffffffff"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			first := experimentBucket(tt.session)
+			for i := 0; i < 16; i++ {
+				if got := experimentBucket(tt.session); got != first {
+					t.Fatalf("bucket changed: first=%d got=%d", first, got)
+				}
+			}
+			if first < 0 || first > 99 {
+				t.Fatalf("bucket=%d, want 0..99", first)
+			}
+		})
+	}
+}
+
+func TestServerABTrafficSplit(t *testing.T) {
+	t.Parallel()
+
+	baselineSession := findSessionForExperiment(t, false)
+	experimentSession := findSessionForExperiment(t, true)
+
+	tests := []struct {
+		name              string
+		session           string
+		wantExpID         string
+		wantReaderCalls   int64
+		wantIntentCalls   int64
+		wantBaselineCalls int64
+	}{
+		{
+			name:              "baseline skips intent reader and uses baseline search",
+			session:           baselineSession,
+			wantExpID:         "baseline",
+			wantReaderCalls:   0,
+			wantIntentCalls:   0,
+			wantBaselineCalls: 1,
+		},
+		{
+			name:              "experiment reads intent and uses intent search",
+			session:           experimentSession,
+			wantExpID:         "neuro_rerank",
+			wantReaderCalls:   1,
+			wantIntentCalls:   1,
+			wantBaselineCalls: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reader := &stubIntentReader{version: 900, fill: func(dst []float32) {
+				for i := range dst {
+					dst[i] = 1
+				}
+			}}
+			searcher := &mockProductSearcher{
+				results: []ProductResult{
+					{ItemID: "intent-db", Category: "phone", Embedding: []float32{1, 1}},
+				},
+				baselineResults: []ProductResult{
+					{ItemID: "baseline-db", Category: "phone", Embedding: []float32{1, 1}},
+				},
+			}
+			producer := &captureProducer{events: make(chan mq.Event, 1)}
+			s := newTestServer(t, Options{
+				CandidateIDs:      []int64{1, 2, 3},
+				VectorDim:         2,
+				MaxInFlight:       8,
+				Timeout:           50 * time.Millisecond,
+				IntentReader:      reader,
+				IntentReadTimeout: 2 * time.Millisecond,
+				ProductSearch:     searcher,
+				BehaviorProducer:  producer,
+			})
+			seedFastRecord(t, s.coordinator, tt.session, 1, []float32{1, 1})
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(tt.session, 1)))
+			s.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
+			}
+			if got := reader.calls.Load(); got != tt.wantReaderCalls {
+				t.Fatalf("intent reader calls=%d want=%d", got, tt.wantReaderCalls)
+			}
+			if got := searcher.intentCalls.Load(); got != tt.wantIntentCalls {
+				t.Fatalf("intent search calls=%d want=%d", got, tt.wantIntentCalls)
+			}
+			if got := searcher.baselineCalls.Load(); got != tt.wantBaselineCalls {
+				t.Fatalf("baseline search calls=%d want=%d", got, tt.wantBaselineCalls)
+			}
+
+			select {
+			case ev := <-producer.events:
+				if ev.SessionID != tt.session || ev.ExpID != tt.wantExpID {
+					t.Fatalf("event got session=%q exp_id=%q want session=%q exp_id=%q", ev.SessionID, ev.ExpID, tt.session, tt.wantExpID)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("producer was not called")
+			}
+		})
+	}
+
+	t.Run("baseline does not fall back to vector ranking when baseline search is empty", func(t *testing.T) {
+		t.Parallel()
+		session := baselineSession
+		reader := &stubIntentReader{version: 900, fill: func(dst []float32) {
+			for i := range dst {
+				dst[i] = 1
+			}
+		}}
+		searcher := &mockProductSearcher{}
+		s := newTestServer(t, Options{
+			CandidateIDs:      []int64{1, 2, 3},
+			VectorDim:         2,
+			MaxInFlight:       8,
+			Timeout:           50 * time.Millisecond,
+			IntentReader:      reader,
+			IntentReadTimeout: 2 * time.Millisecond,
+			ProductSearch:     searcher,
+		})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{1, 1})
+
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(session, 1)))
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d body=%q, want 503", rr.Code, rr.Body.String())
+		}
+		if got := reader.calls.Load(); got != 0 {
+			t.Fatalf("intent reader calls=%d want=0", got)
+		}
+		if got := searcher.intentCalls.Load(); got != 0 {
+			t.Fatalf("intent search calls=%d want=0", got)
+		}
+		if got := searcher.baselineCalls.Load(); got != 1 {
+			t.Fatalf("baseline search calls=%d want=1", got)
+		}
+	})
+
+	t.Run("experiment reaches redis and duckdb before local cache fallback", func(t *testing.T) {
+		t.Parallel()
+		session := experimentSession
+		reader := &stubIntentReader{version: 900, fill: func(dst []float32) {
+			for i := range dst {
+				dst[i] = 1
+			}
+		}}
+		searcher := &mockProductSearcher{results: []ProductResult{{ItemID: "intent-db", Category: "phone", Embedding: []float32{1, 1}}}}
+		s := newTestServer(t, Options{
+			Cache:             cache.NewMemoryClient(cache.Options{Shards: 1, IOTimeout: time.Millisecond}),
+			CandidateIDs:      []int64{999},
+			VectorDim:         2,
+			MaxInFlight:       8,
+			Timeout:           50 * time.Millisecond,
+			IntentReader:      reader,
+			IntentReadTimeout: 2 * time.Millisecond,
+			ProductSearch:     searcher,
+		})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{1, 1})
+
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/rerank", bytes.NewBufferString(validPayload(session, 1)))
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
+		}
+		if got := reader.calls.Load(); got != 1 {
+			t.Fatalf("intent reader calls=%d want=1", got)
+		}
+		if got := searcher.intentCalls.Load(); got != 1 {
+			t.Fatalf("intent search calls=%d want=1", got)
 		}
 	})
 }
@@ -248,9 +466,11 @@ type stubIntentReader struct {
 	minDeadline   time.Duration
 	maxDeadline   time.Duration
 	deadlineErr   atomic.Value
+	calls         atomic.Int64
 }
 
 func (r *stubIntentReader) ReadIntent(ctx context.Context, sessionID string, dst []float32) (int64, error) {
+	r.calls.Add(1)
 	if r.checkDeadline {
 		deadline, ok := ctx.Deadline()
 		if !ok {
@@ -308,18 +528,59 @@ func (p *blockingProducer) Publish(ctx context.Context, ev mq.Event) error {
 
 func (p *blockingProducer) Close() error { return nil }
 
+type captureProducer struct {
+	events chan mq.Event
+}
+
+func (p *captureProducer) Publish(ctx context.Context, ev mq.Event) error {
+	select {
+	case p.events <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *captureProducer) Close() error { return nil }
+
+func findSessionForExperiment(t *testing.T, experiment bool) string {
+	t.Helper()
+	for i := 0; i < 10000; i++ {
+		session := fmt.Sprintf("00000000-0000-4000-8000-%012x", i)
+		bucket := experimentBucket(session)
+		if (bucket >= 50) == experiment {
+			return session
+		}
+	}
+	t.Fatalf("unable to find session for experiment=%v", experiment)
+	return ""
+}
+
 type mockProductSearcher struct {
-	results []ProductResult
-	err     error
+	results         []ProductResult
+	baselineResults []ProductResult
+	err             error
+	baselineErr     error
+	intentCalls     atomic.Int64
+	baselineCalls   atomic.Int64
 }
 
 func (m *mockProductSearcher) SearchWithIntent(
 	_ context.Context, _ []float32, _ string, _ int,
 ) ([]ProductResult, error) {
+	m.intentCalls.Add(1)
 	return m.results, m.err
 }
 
+func (m *mockProductSearcher) SearchBaseline(
+	_ context.Context, _ string, _ int,
+) ([]ProductResult, error) {
+	m.baselineCalls.Add(1)
+	return m.baselineResults, m.baselineErr
+}
+
 func TestServerProductSearchIntegration(t *testing.T) {
+	session := findSessionForExperiment(t, true)
 	t.Run("product search results used for scoring when available", func(t *testing.T) {
 		reader := &stubIntentReader{version: 900, fill: func(dst []float32) {
 			for i := range dst {
@@ -340,11 +601,11 @@ func TestServerProductSearchIntegration(t *testing.T) {
 			IntentReadTimeout: 2 * time.Millisecond,
 			ProductSearch:     searcher,
 		})
-		seedFastRecord(t, s.coordinator, testSessionID, 1, []float32{1, 1})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{1, 1})
 
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/rerank",
-			bytes.NewBufferString(validPayload(testSessionID, 1)))
+			bytes.NewBufferString(validPayload(session, 1)))
 		s.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
@@ -353,7 +614,7 @@ func TestServerProductSearchIntegration(t *testing.T) {
 		if !strings.Contains(body, `"results":[`) {
 			t.Fatal("response must contain results array")
 		}
-		if !strings.Contains(body, `"session_id":"`+testSessionID+`"`) {
+		if !strings.Contains(body, `"session_id":"`+session+`"`) {
 			t.Fatal("response must contain session_id")
 		}
 		t.Logf("product search integration response: %s", body)
@@ -373,11 +634,11 @@ func TestServerProductSearchIntegration(t *testing.T) {
 			IntentReadTimeout: 2 * time.Millisecond,
 			ProductSearch:     nil,
 		})
-		seedFastRecord(t, s.coordinator, testSessionID, 1, []float32{10, 0})
+		seedFastRecord(t, s.coordinator, session, 1, []float32{10, 0})
 
 		rr := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodPost, "/rerank",
-			bytes.NewBufferString(validPayload(testSessionID, 1)))
+			bytes.NewBufferString(validPayload(session, 1)))
 		s.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())

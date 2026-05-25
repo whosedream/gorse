@@ -192,10 +192,12 @@ func (c *closableWindowConsumer) Close() error {
 	return c.closer.Close()
 }
 
+const defaultRedisAddr = "127.0.0.1:6379"
+
 func main() {
 	_ = godotenv.Load()
 
-	redisClient := redis.NewClient(&redis.Options{Addr: envDefault("REDIS_ADDR", "localhost:6379"), Password: os.Getenv("REDIS_PASSWORD"), DB: envInt("REDIS_DB", 0)})
+	redisClient := redis.NewClient(&redis.Options{Addr: envDefault("REDIS_ADDR", defaultRedisAddr), Password: os.Getenv("REDIS_PASSWORD"), DB: envInt("REDIS_DB", 0)})
 	writer, err := cache.NewRedisIntentWriter(cache.RedisIntentWriterOptions{Client: redisClient})
 	if err != nil {
 		log.Fatalf("init redis writer: %v", err)

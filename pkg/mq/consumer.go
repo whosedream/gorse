@@ -21,6 +21,7 @@ type Event struct {
 	CategoryID string `json:"category_id,omitempty"`
 	Timestamp  int64  `json:"timestamp,omitempty"`
 	Action     string `json:"action,omitempty"`
+	ExpID      string `json:"exp_id,omitempty"`
 }
 
 // Batch is a per-session aggregate. BaselineVersion is the max event timestamp.

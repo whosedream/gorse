@@ -1,3 +1,5 @@
+//go:build cgo
+
 package storage
 
 import (
@@ -23,8 +25,8 @@ type Product struct {
 
 // DuckDBClient wraps a DuckDB database connection for vector similarity search.
 type DuckDBClient struct {
-	db         *sql.DB
-	dsn        string
+	db          *sql.DB
+	dsn         string
 	embeddingMu sync.Mutex
 }
 
@@ -145,6 +147,40 @@ func (c *DuckDBClient) initPresetData() error {
 //
 // When category is non-empty, results are filtered by category.
 // Results are ordered by score descending and limited to at most limit rows.
+func (c *DuckDBClient) SearchBaseline(ctx context.Context, category string, limit int) ([]Product, error) {
+	if c == nil || c.db == nil {
+		return nil, errors.New("storage: client not initialized")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	query := `SELECT item_id, title, category, price, image_url, 0.0 AS score FROM products`
+	var args []interface{}
+	if category != "" {
+		query += ` WHERE category = ?`
+		args = append(args, category)
+	}
+	query += ` ORDER BY item_id LIMIT ?`
+	args = append(args, limit)
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var products []Product
+	for rows.Next() {
+		var p Product
+		if err := rows.Scan(&p.ItemID, &p.Title, &p.Category, &p.Price, &p.ImageURL, &p.Score); err != nil {
+			return nil, err
+		}
+		products = append(products, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return products, nil
+}
+
 func (c *DuckDBClient) SearchWithIntent(ctx context.Context, vector []float32, category string, limit int) ([]Product, error) {
 	if c == nil || c.db == nil {
 		return nil, errors.New("storage: client not initialized")

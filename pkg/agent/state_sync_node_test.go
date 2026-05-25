@@ -234,6 +234,178 @@ func TestStateSyncNodeRun(t *testing.T) {
 	}
 }
 
+func TestStateSyncNodeReflectionMetadataLifecycle(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		async     bool
+		writerErr error
+		wantKeep  bool
+	}{
+		{name: "sync success clears reflection metadata"},
+		{name: "sync writer error keeps reflection metadata", writerErr: errors.New("redis unavailable"), wantKeep: true},
+		{name: "async success clears reflection metadata after write", async: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			writer := &mockIntentWriter{writes: make(chan stateSyncWrite, 1), err: tt.writerErr}
+			n := NewStateSyncNode(StateSyncNodeOptions{Writer: writer, Async: tt.async, Timeout: time.Second})
+			st := &State{
+				SessionID:       "s-reflection-sync",
+				IntentVector:    testStateSyncVector(),
+				BaselineVersion: 31,
+				Metadata: map[string]string{
+					"previous_intent_text": "旧意图",
+					"reflection_active":    "true",
+					"other":                "keep",
+				},
+			}
+
+			err := n.Run(context.Background(), st)
+			if tt.writerErr != nil {
+				if !errors.Is(err, tt.writerErr) {
+					t.Fatalf("Run error = %v, want %v", err, tt.writerErr)
+				}
+			} else if err != nil {
+				t.Fatalf("Run error = %v", err)
+			}
+			if tt.async {
+				select {
+				case <-writer.writes:
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for async write")
+				}
+			}
+
+			_, hasPrevious := st.Metadata["previous_intent_text"]
+			_, hasActive := st.Metadata["reflection_active"]
+			if tt.wantKeep {
+				if !hasPrevious || !hasActive {
+					t.Fatalf("reflection metadata was cleared on failed write: %#v", st.Metadata)
+				}
+			} else if hasPrevious || hasActive {
+				t.Fatalf("reflection metadata was not cleared after successful write: %#v", st.Metadata)
+			}
+			if st.Metadata["other"] != "keep" {
+				t.Fatalf("unrelated metadata was modified: %#v", st.Metadata)
+			}
+		})
+	}
+}
+
+func TestStateSyncNodeAsyncPreviousIntentWithoutActiveReflectionStaysAsyncAndKeepsMetadata(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	writer := &mockIntentWriter{writes: make(chan stateSyncWrite, 1), started: started, release: release}
+	n := NewStateSyncNode(StateSyncNodeOptions{Writer: writer, Async: true, Timeout: time.Second})
+	st := &State{
+		SessionID:       "s-async-previous-only",
+		IntentVector:    testStateSyncVector(),
+		BaselineVersion: 39,
+		Metadata: map[string]string{
+			MetadataPreviousIntentText: "旧意图但本轮未触发反思",
+		},
+	}
+
+	if err := n.Run(context.Background(), st); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+	select {
+	case got := <-writer.writes:
+		t.Fatalf("Run did not stay async for previous-only metadata, early write=%+v", got)
+	default:
+	}
+	close(release)
+	select {
+	case <-writer.writes:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async write")
+	}
+	if st.Metadata[MetadataPreviousIntentText] != "旧意图但本轮未触发反思" {
+		t.Fatalf("previous intent metadata was cleared without active reflection: %#v", st.Metadata)
+	}
+}
+
+func TestStateSyncNodeAsyncNonReflectionDoesNotClearLaterReflectionMetadata(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	writer := &mockIntentWriter{writes: make(chan stateSyncWrite, 1), started: started, release: release}
+	n := NewStateSyncNode(StateSyncNodeOptions{Writer: writer, Async: true, Timeout: time.Second})
+	st := &State{SessionID: "s-async-normal", IntentVector: testStateSyncVector(), BaselineVersion: 40, Metadata: map[string]string{}}
+
+	if err := n.Run(context.Background(), st); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+	st.Metadata[MetadataPreviousIntentText] = "新反思上下文"
+	st.Metadata[MetadataReflectionActive] = "true"
+	close(release)
+	select {
+	case <-writer.writes:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for async write")
+	}
+	if st.Metadata[MetadataPreviousIntentText] != "新反思上下文" || st.Metadata[MetadataReflectionActive] != "true" {
+		t.Fatalf("non-reflection async write cleared later reflection metadata: %#v", st.Metadata)
+	}
+}
+
+func TestStateSyncNodeAsyncReflectionWaitsForWriteBeforeClearingMetadata(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	writer := &mockIntentWriter{writes: make(chan stateSyncWrite, 1), started: started, release: release}
+	n := NewStateSyncNode(StateSyncNodeOptions{Writer: writer, Async: true, Timeout: time.Second})
+	st := &State{
+		SessionID:       "s-async-reflection",
+		IntentVector:    testStateSyncVector(),
+		BaselineVersion: 41,
+		Metadata: map[string]string{
+			MetadataPreviousIntentText: "旧意图",
+			MetadataReflectionActive:   "true",
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- n.Run(context.Background(), st) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not start")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before reflection write completed: %v", err)
+	default:
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after write release")
+	}
+	if _, ok := st.Metadata[MetadataPreviousIntentText]; ok {
+		t.Fatalf("previous intent metadata was not cleared: %#v", st.Metadata)
+	}
+	if _, ok := st.Metadata[MetadataReflectionActive]; ok {
+		t.Fatalf("reflection active metadata was not cleared: %#v", st.Metadata)
+	}
+}
+
 func testStateSyncVector() []float32 {
 	v := make([]float32, 1024)
 	for i := range v {

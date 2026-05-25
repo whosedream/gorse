@@ -23,6 +23,8 @@ import (
 	"go-rec/pkg/pool"
 )
 
+const defaultRedisAddr = "127.0.0.1:6379"
+
 func envDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -70,7 +72,7 @@ func main() {
 		log.Printf("kafka producer disabled: %v", err)
 	}
 	var intentReader cache.IntentReader
-	redisClient := redis.NewClient(&redis.Options{Addr: envDefault("REDIS_ADDR", "localhost:6379"), Password: os.Getenv("REDIS_PASSWORD"), DB: envInt("REDIS_DB", 0)})
+	redisClient := redis.NewClient(&redis.Options{Addr: envDefault("REDIS_ADDR", defaultRedisAddr), Password: os.Getenv("REDIS_PASSWORD"), DB: envInt("REDIS_DB", 0)})
 	if reader, err := cache.NewRedisIntentReader(cache.RedisIntentReaderOptions{Client: redisClient}); err == nil {
 		intentReader = reader
 	} else {

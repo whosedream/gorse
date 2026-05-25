@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -171,6 +171,13 @@ func TestAgentDaemonWaitsForWorkflowAfterConsumerClose(t *testing.T) {
 	close(writer.release)
 	if err := <-done; err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 		t.Fatalf("RunDaemon returned error: %v", err)
+	}
+}
+
+func TestRedisDefaultAddressUsesIPv4Loopback(t *testing.T) {
+	t.Setenv("REDIS_ADDR", "")
+	if got := envDefault("REDIS_ADDR", defaultRedisAddr); got != "127.0.0.1:6379" {
+		t.Fatalf("default redis addr = %q, want 127.0.0.1:6379", got)
 	}
 }
 

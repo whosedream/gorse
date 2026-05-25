@@ -6,6 +6,13 @@ import (
 	"testing"
 )
 
+func TestRedisDefaultAddressUsesIPv4Loopback(t *testing.T) {
+	t.Setenv("REDIS_ADDR", "")
+	if got := envDefault("REDIS_ADDR", defaultRedisAddr); got != "127.0.0.1:6379" {
+		t.Fatalf("default redis addr = %q, want 127.0.0.1:6379", got)
+	}
+}
+
 func TestEnvFiles(t *testing.T) {
 	t.Parallel()
 

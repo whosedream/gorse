@@ -52,6 +52,21 @@ func (n *stateSyncNode) Deps() []string { return append([]string(nil), n.deps...
 
 func (n *stateSyncNode) Kind() NodeKind { return NodeSymbol }
 
+func clearReflectionMetadata(st *State) {
+	if st == nil || len(st.Metadata) == 0 {
+		return
+	}
+	delete(st.Metadata, MetadataPreviousIntentText)
+	delete(st.Metadata, MetadataReflectionActive)
+}
+
+func hasActiveReflection(st *State) bool {
+	if st == nil || len(st.Metadata) == 0 {
+		return false
+	}
+	return st.Metadata[MetadataReflectionActive] == "true"
+}
+
 func (n *stateSyncNode) Run(ctx context.Context, st *State) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -64,6 +79,7 @@ func (n *stateSyncNode) Run(ctx context.Context, st *State) error {
 	if n == nil || n.writer == nil || st == nil || st.SessionID == "" || len(st.IntentVector) != cache.IntentVectorDim || st.BaselineVersion <= 0 {
 		return ErrInvalidNode
 	}
+	clearReflection := hasActiveReflection(st)
 	sessionID := st.SessionID
 	vector := make([]float32, len(st.IntentVector))
 	copy(vector, st.IntentVector)
@@ -72,9 +88,15 @@ func (n *stateSyncNode) Run(ctx context.Context, st *State) error {
 		base := context.WithoutCancel(ctx)
 		writeCtx, cancel := context.WithTimeout(base, n.timeout)
 		defer cancel()
-		return n.writer.WriteIntent(writeCtx, sessionID, vector, version)
+		if err := n.writer.WriteIntent(writeCtx, sessionID, vector, version); err != nil {
+			return err
+		}
+		if clearReflection {
+			clearReflectionMetadata(st)
+		}
+		return nil
 	}
-	if !n.async {
+	if !n.async || clearReflection {
 		return write()
 	}
 	go func() {

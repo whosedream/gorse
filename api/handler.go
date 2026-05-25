@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"strconv"
@@ -21,10 +22,21 @@ var (
 	ErrNoCandidates   = errors.New("api: no available candidates")
 )
 
+const (
+	experimentBaseline    = "baseline"
+	experimentNeuroRerank = "neuro_rerank"
+)
+
+var fnv32aOffset = fnv.New32a().Sum32()
+
 // ProductSearcher abstracts a DuckDB-like vector search backend.  nil means
 // the handler falls back to cache-based scoring.
 type ProductSearcher interface {
 	SearchWithIntent(ctx context.Context, vector []float32, category string, limit int) ([]ProductResult, error)
+}
+
+type baselineProductSearcher interface {
+	SearchBaseline(ctx context.Context, category string, limit int) ([]ProductResult, error)
 }
 
 // ProductResult is a single row returned by ProductSearcher.
@@ -117,8 +129,8 @@ func NewServer(opts Options) (*Server, error) {
 		intentReader:      opts.IntentReader,
 		intentReadTimeout: opts.IntentReadTimeout,
 		intentPool:        pool.NewIntentVectorPool(),
-			productSearch:     opts.ProductSearch,
-		}
+		productSearch:     opts.ProductSearch,
+	}
 	if s.intentReadTimeout <= 0 {
 		s.intentReadTimeout = 2 * time.Millisecond
 	}
@@ -128,7 +140,22 @@ func NewServer(opts Options) (*Server, error) {
 
 func (s *Server) Handler() http.Handler { return s }
 
+func applyCORS(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "http://127.0.0.1:5173" || origin == "http://localhost:5173" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	}
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	applyCORS(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if s == nil || s.parser == nil || s.cache == nil || s.coordinator == nil || s.scorer == nil || s.pool == nil || s.reqPool == nil {
 		http.Error(w, "server unavailable", http.StatusInternalServerError)
 		return
@@ -180,22 +207,71 @@ func (s *Server) handle(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	if err := s.parser.Parse(ctx, st.body, &st.req); err != nil {
 		return err
 	}
-	s.publishBehavior(st.req)
+	sessionID := st.req.SessionIDString()
+	expID := experimentID(sessionID)
+	s.publishBehavior(st.req, expID)
+
+	if expID == experimentBaseline {
+		ensureBaselineCapacity(st, 20)
+		if bs, ok := s.productSearch.(baselineProductSearcher); ok {
+			category := st.req.CategoryString()
+			dbResults, dbErr := bs.SearchBaseline(ctx, category, 20)
+			if dbErr == nil && len(dbResults) > 0 {
+				results := st.results[:len(dbResults)]
+				n := productResultsToResults(dbResults, results)
+				writeResponse(w, sessionID, st.req.Fallback, false, results[:n])
+				return nil
+			}
+		}
+		return ErrNoCandidates
+	}
 
 	ids := s.candidateIDs
 	ensureRequestCapacity(st, len(ids), s.vectorDim)
+	ensureDuckDBCapacity(st, 20)
+	if expID == experimentNeuroRerank && s.intentReader != nil {
+		return s.intentPool.With(ctx, func(intent []float32) error {
+			readCtx, cancel := context.WithTimeout(ctx, s.intentReadTimeout)
+			_, readErr := s.intentReader.ReadIntent(readCtx, sessionID, intent)
+			cancel()
+			if readErr == nil && s.productSearch != nil {
+				category := st.req.CategoryString()
+				dbResults, dbErr := s.productSearch.SearchWithIntent(ctx, intent, category, 20)
+				if dbErr == nil && len(dbResults) > 0 {
+					dbCandidates := st.candidates[:len(dbResults)]
+					productResultsToCandidates(dbResults, dbCandidates)
+					results := st.results[:len(dbCandidates)]
+					n, err := s.scorer.Rank(ctx, intent, dbCandidates, results)
+					if err != nil {
+						return err
+					}
+					fallback := st.req.Fallback
+					if rec, ok := s.coordinator.Get(sessionID); ok {
+						fallback = fallback || rec.Fallback
+					}
+					writeResponse(w, sessionID, fallback, true, results[:n])
+					return nil
+				}
+			}
+			return s.handleCacheFallback(ctx, w, st, sessionID, readErr == nil, intent)
+		})
+	}
+	return s.handleCacheFallback(ctx, w, st, sessionID, false, nil)
+}
+
+func (s *Server) handleCacheFallback(ctx context.Context, w http.ResponseWriter, st *requestState, sessionID string, useIntent bool, intent []float32) error {
+	ids := s.candidateIDs
 	features := st.features[:len(ids)]
 	vectorBuf := st.vectorBuf[:len(ids)*s.vectorDim]
 	if err := s.cache.MGetInto(ctx, ids, features, vectorBuf, s.vectorDim); err != nil {
 		return err
 	}
 
-	sessionID := st.req.SessionIDString()
 	rec, ok := s.coordinator.Get(sessionID)
 	if !ok || len(rec.IntentVector) == 0 {
-		intent := st.intent[:s.vectorDim]
-		fillDefaultIntent(intent, st.req.CategoryString(), st.req.BrandString())
-		if err := s.coordinator.UpdateFast(ctx, anti_drift.FastTrackSnapshot{SessionID: sessionID, LatestVersion: st.req.VersionStamp, IntentVector: intent}); err != nil {
+		defaultIntent := st.intent[:s.vectorDim]
+		fillDefaultIntent(defaultIntent, st.req.CategoryString(), st.req.BrandString())
+		if err := s.coordinator.UpdateFast(ctx, anti_drift.FastTrackSnapshot{SessionID: sessionID, LatestVersion: st.req.VersionStamp, IntentVector: defaultIntent}); err != nil {
 			return err
 		}
 		rec, _ = s.coordinator.Get(sessionID)
@@ -218,58 +294,57 @@ func (s *Server) handle(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	}
 
 	results := st.results[:len(candidates)]
-	if s.intentReader != nil {
-		return s.intentPool.With(ctx, func(intent []float32) error {
-			readCtx, cancel := context.WithTimeout(ctx, s.intentReadTimeout)
-			_, readErr := s.intentReader.ReadIntent(readCtx, sessionID, intent)
-			cancel()
-			if readErr == nil {
-				// DuckDB integration: narrow candidate pool via vector search.
-				if s.productSearch != nil {
-					category := st.req.CategoryString()
-					dbResults, dbErr := s.productSearch.SearchWithIntent(ctx, intent, category, 20)
-					if dbErr == nil && len(dbResults) > 0 {
-						dbCandidates := productResultsToCandidates(dbResults)
-						n, err := s.scorer.Rank(ctx, intent, dbCandidates, results)
-						if err != nil {
-							return err
-						}
-						writeResponse(w, sessionID, rec.Fallback || st.req.Fallback, results[:n])
-						return nil
-					}
-					// ProductSearch failed; fall through to cache-based path.
-				}
-				n, err := s.scorer.Rank(ctx, intent, candidates, results)
-				if err != nil {
-					return err
-				}
-				writeResponse(w, sessionID, rec.Fallback || st.req.Fallback, results[:n])
-				return nil
-			}
-			n, err := s.scorer.RankParallel(ctx, s.pool, rec.IntentVector, candidates, results)
-			if err != nil {
-				return err
-			}
-			writeResponse(w, sessionID, rec.Fallback || st.req.Fallback, results[:n])
-			return nil
-		})
+	var n int
+	var err error
+	if useIntent {
+		n, err = s.scorer.Rank(ctx, intent, candidates, results)
+	} else {
+		n, err = s.scorer.RankParallel(ctx, s.pool, rec.IntentVector, candidates, results)
 	}
-	n, err := s.scorer.RankParallel(ctx, s.pool, rec.IntentVector, candidates, results)
 	if err != nil {
 		return err
 	}
-	writeResponse(w, sessionID, rec.Fallback || st.req.Fallback, results[:n])
+	writeResponse(w, sessionID, rec.Fallback || st.req.Fallback, useIntent, results[:n])
 	return nil
 }
 
-func (s *Server) publishBehavior(req fsm.RerankRequest) {
+func (s *Server) publishBehavior(req fsm.RerankRequest, expID string) {
 	if s.producer == nil {
 		return
 	}
-	ev := mq.Event{SessionID: req.SessionIDString(), Timestamp: req.VersionStamp, Action: "rerank"}
+	ev := mq.Event{SessionID: req.SessionIDString(), Timestamp: req.VersionStamp, Action: "rerank", ExpID: expID}
 	_ = s.pool.Submit(context.Background(), func(ctx context.Context) error {
 		return s.producer.Publish(ctx, ev)
 	})
+}
+
+func experimentID(sessionID string) string {
+	if experimentBucket(sessionID) < 50 {
+		return experimentBaseline
+	}
+	return experimentNeuroRerank
+}
+
+func experimentBucket(sessionID string) int {
+	h := fnv32aOffset
+	for i := 0; i < len(sessionID); i++ {
+		h ^= uint32(sessionID[i])
+		h *= 16777619
+	}
+	return int(h % 100)
+}
+
+func ensureBaselineCapacity(st *requestState, n int) {
+	if cap(st.results) < n {
+		st.results = make([]scorer.Result, n)
+	}
+}
+
+func ensureDuckDBCapacity(st *requestState, n int) {
+	ensureBaselineCapacity(st, n)
+	if cap(st.candidates) < n {
+		st.candidates = make([]scorer.Candidate, 0, n)
+	}
 }
 
 func ensureRequestCapacity(st *requestState, n int, dim int) {
@@ -341,11 +416,25 @@ func fillDefaultIntent(out []float32, category, brand string) {
 	}
 }
 
+func productResultsToResults(products []ProductResult, out []scorer.Result) int {
+	n := len(products)
+	if n > len(out) {
+		n = len(out)
+	}
+	for i := 0; i < n; i++ {
+		out[i] = scorer.Result{
+			ID:       hashStringToInt64(products[i].ItemID),
+			Score:    float32(products[i].Score),
+			Category: products[i].Category,
+		}
+	}
+	return n
+}
+
 // productResultsToCandidates converts search results to scorer.Candidate
 // values. Each result's embedding becomes the Feature for dot-product scoring.
 // The ItemID is hashed to produce an int64 ID for the scorer pipeline.
-func productResultsToCandidates(results []ProductResult) []scorer.Candidate {
-	candidates := make([]scorer.Candidate, len(results))
+func productResultsToCandidates(results []ProductResult, candidates []scorer.Candidate) {
 	for i, r := range results {
 		id := hashStringToInt64(r.ItemID)
 		candidates[i] = scorer.Candidate{
@@ -355,7 +444,6 @@ func productResultsToCandidates(results []ProductResult) []scorer.Candidate {
 			Feature:  r.Embedding,
 		}
 	}
-	return candidates
 }
 
 // hashStringToInt64 produces a positive int64 from a string using FNV-1a.
@@ -368,13 +456,19 @@ func hashStringToInt64(s string) int64 {
 	return int64(h & 0x7FFFFFFFFFFFFFFF)
 }
 
-func writeResponse(w http.ResponseWriter, sessionID string, fallback bool, results []scorer.Result) {
+func writeResponse(w http.ResponseWriter, sessionID string, fallback bool, intentHit bool, results []scorer.Result) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"session_id":"`))
 	_, _ = w.Write([]byte(sessionID))
 	_, _ = w.Write([]byte(`","fallback":`))
 	if fallback {
+		_, _ = w.Write([]byte("true"))
+	} else {
+		_, _ = w.Write([]byte("false"))
+	}
+	_, _ = w.Write([]byte(`,"intent_hit":`))
+	if intentHit {
 		_, _ = w.Write([]byte("true"))
 	} else {
 		_, _ = w.Write([]byte("false"))

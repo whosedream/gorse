@@ -32,8 +32,8 @@ func TestKafkaProducerPublishesSessionKeyAndJSONValue(t *testing.T) {
 		ev   Event
 	}{
 		{
-			name: "happy path uses SessionID as key",
-			ev:   Event{SessionID: "s-1", UserID: "u-1", ItemID: "sku-1", CategoryID: "cat", Timestamp: 42, Action: "click"},
+			name: "happy path uses SessionID as key and preserves exp_id",
+			ev:   Event{SessionID: "s-1", UserID: "u-1", ItemID: "sku-1", CategoryID: "cat", Timestamp: 42, Action: "click", ExpID: "baseline"},
 		},
 		{
 			name: "empty payload remains valid JSON and empty key",
@@ -66,7 +66,7 @@ func TestKafkaProducerPublishesSessionKeyAndJSONValue(t *testing.T) {
 			if err := json.Unmarshal(msg.Value, &got); err != nil {
 				t.Fatalf("value is not Event JSON: %v raw=%q", err, string(msg.Value))
 			}
-			if got.SessionID != tt.ev.SessionID || got.UserID != tt.ev.UserID || got.ItemID != tt.ev.ItemID || got.CategoryID != tt.ev.CategoryID || got.Timestamp != tt.ev.Timestamp || got.Action != tt.ev.Action {
+			if got.SessionID != tt.ev.SessionID || got.UserID != tt.ev.UserID || got.ItemID != tt.ev.ItemID || got.CategoryID != tt.ev.CategoryID || got.Timestamp != tt.ev.Timestamp || got.Action != tt.ev.Action || got.ExpID != tt.ev.ExpID {
 				t.Fatalf("decoded event mismatch: got=%+v want=%+v", got, tt.ev)
 			}
 		})

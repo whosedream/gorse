@@ -50,6 +50,16 @@ type duckDBAdapter struct {
 	client *storage.DuckDBClient
 }
 
+func (a *duckDBAdapter) SearchBaseline(
+	ctx context.Context, category string, limit int,
+) ([]api.ProductResult, error) {
+	products, err := a.client.SearchBaseline(ctx, category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return productsToAPIResults(products), nil
+}
+
 func (a *duckDBAdapter) SearchWithIntent(
 	ctx context.Context, vector []float32, category string, limit int,
 ) ([]api.ProductResult, error) {
@@ -57,6 +67,10 @@ func (a *duckDBAdapter) SearchWithIntent(
 	if err != nil {
 		return nil, err
 	}
+	return productsToAPIResults(products), nil
+}
+
+func productsToAPIResults(products []storage.Product) []api.ProductResult {
 	out := make([]api.ProductResult, len(products))
 	for i, p := range products {
 		out[i] = api.ProductResult{
@@ -69,5 +83,5 @@ func (a *duckDBAdapter) SearchWithIntent(
 			Embedding: p.Embedding,
 		}
 	}
-	return out, nil
+	return out
 }

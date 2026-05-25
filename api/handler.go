@@ -3,14 +3,19 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"go-rec/internal/rk/anti_drift"
 	"go-rec/internal/rk/scorer"
+	"go-rec/pkg/agent"
 	"go-rec/pkg/cache"
 	"go-rec/pkg/fsm"
 	"go-rec/pkg/mq"
@@ -50,6 +55,31 @@ type ProductResult struct {
 	Embedding []float32
 }
 
+type streamPubSub interface {
+	Channel() <-chan *redis.Message
+	Close() error
+}
+
+type streamSubscriber interface {
+	Subscribe(ctx context.Context, channels ...string) streamPubSub
+}
+
+type redisStreamSubscriber struct {
+	client redis.UniversalClient
+}
+
+func (s redisStreamSubscriber) Subscribe(ctx context.Context, channels ...string) streamPubSub {
+	return redisStreamPubSub{pubsub: s.client.Subscribe(ctx, channels...)}
+}
+
+type redisStreamPubSub struct {
+	pubsub *redis.PubSub
+}
+
+func (p redisStreamPubSub) Channel() <-chan *redis.Message { return p.pubsub.Channel() }
+
+func (p redisStreamPubSub) Close() error { return p.pubsub.Close() }
+
 type Server struct {
 	parser            *fsm.Parser
 	cache             *cache.MemoryClient
@@ -66,6 +96,7 @@ type Server struct {
 	intentReadTimeout time.Duration
 	intentPool        *pool.IntentVectorPool
 	productSearch     ProductSearcher
+	streamSubscriber  streamSubscriber
 }
 
 type Options struct {
@@ -81,6 +112,8 @@ type Options struct {
 	IntentReader      cache.IntentReader
 	IntentReadTimeout time.Duration
 	ProductSearch     ProductSearcher
+	StreamSubscriber  streamSubscriber
+	RedisClient       redis.UniversalClient
 }
 
 type requestState struct {
@@ -109,6 +142,10 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.VectorDim == 0 {
 		opts.VectorDim = 2
 	}
+	streamSub := opts.StreamSubscriber
+	if streamSub == nil && opts.RedisClient != nil {
+		streamSub = redisStreamSubscriber{client: opts.RedisClient}
+	}
 	ids := opts.CandidateIDs
 	if len(ids) == 0 {
 		ids = []int64{1, 2, 3}
@@ -130,6 +167,7 @@ func NewServer(opts Options) (*Server, error) {
 		intentReadTimeout: opts.IntentReadTimeout,
 		intentPool:        pool.NewIntentVectorPool(),
 		productSearch:     opts.ProductSearch,
+		streamSubscriber:  streamSub,
 	}
 	if s.intentReadTimeout <= 0 {
 		s.intentReadTimeout = 2 * time.Millisecond
@@ -145,7 +183,7 @@ func applyCORS(w http.ResponseWriter, r *http.Request) {
 	if origin == "http://127.0.0.1:5173" || origin == "http://localhost:5173" {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Vary", "Origin")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	}
 }
@@ -154,6 +192,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	applyCORS(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/stream" {
+		s.handleStream(w, r)
 		return
 	}
 	if s == nil || s.parser == nil || s.cache == nil || s.coordinator == nil || s.scorer == nil || s.pool == nil || s.reqPool == nil {
@@ -193,6 +235,56 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
+}
+
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	if s == nil || s.streamSubscriber == nil {
+		http.Error(w, "stream unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		http.Error(w, "missing session_id", http.StatusBadRequest)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "stream unsupported", http.StatusInternalServerError)
+		return
+	}
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	pubsub := s.streamSubscriber.Subscribe(r.Context(), agent.SSELogChannelPrefix+sessionID)
+	defer pubsub.Close()
+	messages := pubsub.Channel()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case msg, ok := <-messages:
+			if !ok {
+				return
+			}
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", sanitizeSSEData(msg.Payload))
+			flusher.Flush()
+		}
+	}
+}
+
+func sanitizeSSEData(in string) string {
+	if in == "" {
+		return ""
+	}
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n':
+			return ' '
+		default:
+			return r
+		}
+	}, in)
 }
 
 func (s *Server) handle(ctx context.Context, w http.ResponseWriter, r *http.Request, st *requestState) error {

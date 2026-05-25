@@ -96,6 +96,7 @@ func main() {
 		BehaviorProducer: behaviorProducer,
 		IntentReader:     intentReader,
 		ProductSearch:    initDuckDB(),
+		RedisClient:      redisClient,
 	})
 	if err != nil {
 		log.Fatalf("api: %v", err)

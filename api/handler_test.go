@@ -13,8 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"go-rec/internal/rk/anti_drift"
 	"go-rec/internal/rk/scorer"
+	"go-rec/pkg/agent"
 	"go-rec/pkg/cache"
 	"go-rec/pkg/fsm"
 	"go-rec/pkg/mq"
@@ -240,6 +243,61 @@ func TestServerIntentReader(t *testing.T) {
 		}
 		if reader.deadlineErr.Load() != nil {
 			t.Fatalf("deadline check failed: %v", reader.deadlineErr.Load())
+		}
+	})
+}
+
+func TestServerStreamSSE(t *testing.T) {
+	t.Parallel()
+
+	t.Run("streams redis pubsub message with vite cors headers", func(t *testing.T) {
+		t.Parallel()
+		streamer := newFakeStreamSubscriber()
+		s := newTestServer(t, Options{StreamSubscriber: streamer})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req := httptest.NewRequest(http.MethodGet, "/stream?session_id=s1", nil).WithContext(ctx)
+		req.Header.Set("Origin", "http://127.0.0.1:5173")
+		rw := newBlockingResponseRecorder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.ServeHTTP(rw, req)
+		}()
+
+		streamer.waitSubscribed(t, agent.SSELogChannelPrefix+"s1")
+		streamer.publish("hello\nworld")
+		rw.waitBodyContains(t, "data: hello world\n\n")
+		cancel()
+		streamer.waitClosed(t)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("stream handler did not return after context cancel")
+		}
+
+		if got := rw.Header().Get("Content-Type"); got != "text/event-stream" {
+			t.Fatalf("Content-Type = %q", got)
+		}
+		if got := rw.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("Cache-Control = %q", got)
+		}
+		if got := rw.Header().Get("Connection"); got != "keep-alive" {
+			t.Fatalf("Connection = %q", got)
+		}
+		if got := rw.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1:5173" {
+			t.Fatalf("Access-Control-Allow-Origin = %q", got)
+		}
+	})
+
+	t.Run("missing session id returns bad request", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{StreamSubscriber: newFakeStreamSubscriber()})
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/stream", nil)
+		s.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%q, want 400", rr.Code, rr.Body.String())
 		}
 	})
 }
@@ -662,6 +720,111 @@ func BenchmarkServerGoldenPath(b *testing.B) {
 		s.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			b.Fatalf("status = %d body=%q", rr.Code, rr.Body.String())
+		}
+	}
+}
+
+type fakeStreamSubscriber struct {
+	subscribed chan string
+	messages   chan *redis.Message
+	closed     chan struct{}
+}
+
+func newFakeStreamSubscriber() *fakeStreamSubscriber {
+	return &fakeStreamSubscriber{subscribed: make(chan string, 1), messages: make(chan *redis.Message, 8), closed: make(chan struct{})}
+}
+
+func (s *fakeStreamSubscriber) Subscribe(ctx context.Context, channels ...string) streamPubSub {
+	if len(channels) > 0 {
+		s.subscribed <- channels[0]
+	}
+	return &fakeStreamPubSub{ctx: ctx, parent: s}
+}
+
+func (s *fakeStreamSubscriber) publish(payload string) {
+	s.messages <- &redis.Message{Payload: payload}
+}
+
+func (s *fakeStreamSubscriber) waitSubscribed(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case got := <-s.subscribed:
+		if got != want {
+			t.Fatalf("subscribed channel = %q want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for subscription")
+	}
+}
+
+func (s *fakeStreamSubscriber) waitClosed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-s.closed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pubsub close")
+	}
+}
+
+type fakeStreamPubSub struct {
+	ctx    context.Context
+	parent *fakeStreamSubscriber
+}
+
+func (p *fakeStreamPubSub) Channel() <-chan *redis.Message { return p.parent.messages }
+
+func (p *fakeStreamPubSub) Close() error {
+	select {
+	case <-p.parent.closed:
+	default:
+		close(p.parent.closed)
+	}
+	return nil
+}
+
+type blockingResponseRecorder struct {
+	header http.Header
+	body   strings.Builder
+	mu     sync.Mutex
+	notify chan struct{}
+	code   int
+}
+
+func newBlockingResponseRecorder() *blockingResponseRecorder {
+	return &blockingResponseRecorder{header: make(http.Header), notify: make(chan struct{}, 32), code: http.StatusOK}
+}
+
+func (r *blockingResponseRecorder) Header() http.Header { return r.header }
+
+func (r *blockingResponseRecorder) WriteHeader(code int) { r.code = code }
+
+func (r *blockingResponseRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	n, err := r.body.Write(p)
+	r.mu.Unlock()
+	select {
+	case r.notify <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+func (r *blockingResponseRecorder) Flush() {}
+
+func (r *blockingResponseRecorder) waitBodyContains(t *testing.T, want string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		r.mu.Lock()
+		body := r.body.String()
+		r.mu.Unlock()
+		if strings.Contains(body, want) {
+			return
+		}
+		select {
+		case <-r.notify:
+		case <-deadline:
+			t.Fatalf("body %q does not contain %q", body, want)
 		}
 	}
 }

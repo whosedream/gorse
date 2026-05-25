@@ -9,17 +9,19 @@ import (
 )
 
 type EmbeddingNodeOptions struct {
-	ID       string
-	Deps     []string
-	Embedder Embedder
-	Logger   interface{ Printf(string, ...any) }
+	ID           string
+	Deps         []string
+	Embedder     Embedder
+	Logger       interface{ Printf(string, ...any) }
+	LogPublisher LogPublisher
 }
 
 type embeddingNode struct {
-	id       string
-	deps     []string
-	embedder Embedder
-	logger   interface{ Printf(string, ...any) }
+	id           string
+	deps         []string
+	embedder     Embedder
+	logger       interface{ Printf(string, ...any) }
+	logPublisher LogPublisher
 }
 
 func NewEmbeddingNode(opts EmbeddingNodeOptions) Node {
@@ -27,7 +29,7 @@ func NewEmbeddingNode(opts EmbeddingNodeOptions) Node {
 	if id == "" {
 		id = "embedding"
 	}
-	return &embeddingNode{id: id, deps: append([]string(nil), opts.Deps...), embedder: opts.Embedder, logger: opts.Logger}
+	return &embeddingNode{id: id, deps: append([]string(nil), opts.Deps...), embedder: opts.Embedder, logger: opts.Logger, logPublisher: opts.LogPublisher}
 }
 
 func (n *embeddingNode) ID() string { return n.id }
@@ -52,6 +54,7 @@ func (n *embeddingNode) Run(ctx context.Context, st *State) error {
 	vec, err := n.embedder.Embed(ctx, text)
 	if err == nil {
 		st.IntentVector = vec
+		publishDAGLog(ctx, n.logPublisher, st.SessionID, "[向量生成] 远程 embedding 生成完成")
 		return nil
 	}
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -63,7 +66,11 @@ func (n *embeddingNode) Run(ctx context.Context, st *State) error {
 	if n.logger != nil {
 		n.logger.Printf("embedding fallback after embedder error: %v", err)
 	}
-	return SimulateEmbedding(st)
+	if err := SimulateEmbedding(st); err != nil {
+		return err
+	}
+	publishDAGLog(ctx, n.logPublisher, st.SessionID, "[向量生成] fallback embedding 生成完成")
+	return nil
 }
 
 func BuildEmbeddingText(st *State) string {

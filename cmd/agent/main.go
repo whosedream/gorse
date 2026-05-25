@@ -32,12 +32,13 @@ type batchConsumer interface {
 }
 
 type DaemonDeps struct {
-	Consumer    batchConsumer
-	LLM         LLM
-	Embedder    agent.Embedder
-	Writer      cache.IntentWriter
-	BatchBuffer int
-	Logger      interface{ Printf(string, ...any) }
+	Consumer     batchConsumer
+	LLM          LLM
+	Embedder     agent.Embedder
+	Writer       cache.IntentWriter
+	LogPublisher agent.LogPublisher
+	BatchBuffer  int
+	Logger       interface{ Printf(string, ...any) }
 }
 
 type Daemon struct {
@@ -66,15 +67,15 @@ func (a graphLLMAdapter) Complete(ctx context.Context, prompt string) (string, e
 	return a.llm.Complete(ctx, LLMRequest{UserPrompt: prompt, EnableCoT: true})
 }
 
-func BuildGraph(llm LLM, embedder agent.Embedder, writer cache.IntentWriter) (*agent.Graph, error) {
+func BuildGraph(llm LLM, embedder agent.Embedder, writer cache.IntentWriter, publisher agent.LogPublisher) (*agent.Graph, error) {
 	return agent.NewGraph(
-		agent.NewNeuralIntentNode(agent.NeuralNodeOptions{ID: "neural_intent", Client: graphLLMAdapter{llm: llm}, PromptBuilder: agent.DefaultPromptBuilder()}),
-		agent.NewEmbeddingNode(agent.EmbeddingNodeOptions{ID: "embedding", Deps: []string{"neural_intent"}, Embedder: embedder}),
-		agent.NewStateSyncNode(agent.StateSyncNodeOptions{ID: "state_sync", Deps: []string{"embedding"}, Writer: writer}),
+		agent.NewNeuralIntentNode(agent.NeuralNodeOptions{ID: "neural_intent", Client: graphLLMAdapter{llm: llm}, PromptBuilder: agent.DefaultPromptBuilder(), LogPublisher: publisher}),
+		agent.NewEmbeddingNode(agent.EmbeddingNodeOptions{ID: "embedding", Deps: []string{"neural_intent"}, Embedder: embedder, LogPublisher: publisher}),
+		agent.NewStateSyncNode(agent.StateSyncNodeOptions{ID: "state_sync", Deps: []string{"embedding"}, Writer: writer, LogPublisher: publisher}),
 	)
 }
 
-func RunBatch(ctx context.Context, batch mq.Batch, llm LLM, embedder agent.Embedder, writer cache.IntentWriter) error {
+func RunBatch(ctx context.Context, batch mq.Batch, llm LLM, embedder agent.Embedder, writer cache.IntentWriter, publisher agent.LogPublisher) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -85,7 +86,7 @@ func RunBatch(ctx context.Context, batch mq.Batch, llm LLM, embedder agent.Embed
 		sessionID = batch.UserID
 	}
 	st := &agent.State{SessionID: sessionID, BaselineVersion: batch.BaselineVersion, Events: batch.Events}
-	g, err := BuildGraph(llm, embedder, writer)
+	g, err := BuildGraph(llm, embedder, writer, publisher)
 	if err != nil {
 		return err
 	}
@@ -138,7 +139,7 @@ func RunDaemon(ctx context.Context, deps DaemonDeps) error {
 			wg.Add(1)
 			go func(b mq.Batch) {
 				defer wg.Done()
-				recordErr(RunBatch(workflowCtx, b, deps.LLM, deps.Embedder, deps.Writer))
+				recordErr(RunBatch(workflowCtx, b, deps.LLM, deps.Embedder, deps.Writer, deps.LogPublisher))
 			}(batch)
 		case <-ctx.Done():
 			_ = deps.Consumer.Close()
@@ -212,7 +213,8 @@ func main() {
 	}
 	llmClient := slow_track.NewClientFromEnv()
 	embedder := agent.NewRemoteEmbedderFromEnv()
-	deps := DaemonDeps{Consumer: &closableWindowConsumer{consumer: consumer, closer: source}, LLM: slowTrackLLMAdapter{client: llmClient}, Embedder: embedder, Writer: writer, Logger: log.Default()}
+	logPublisher := agent.NewRedisLogPublisher(redisClient)
+	deps := DaemonDeps{Consumer: &closableWindowConsumer{consumer: consumer, closer: source}, LLM: slowTrackLLMAdapter{client: llmClient}, Embedder: embedder, Writer: writer, LogPublisher: logPublisher, Logger: log.Default()}
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

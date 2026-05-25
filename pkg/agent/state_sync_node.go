@@ -10,21 +10,23 @@ import (
 const defaultStateSyncTimeout = 2 * time.Second
 
 type StateSyncNodeOptions struct {
-	ID      string
-	Deps    []string
-	Writer  cache.IntentWriter
-	Timeout time.Duration
-	Async   bool
-	Logger  interface{ Printf(string, ...any) }
+	ID           string
+	Deps         []string
+	Writer       cache.IntentWriter
+	Timeout      time.Duration
+	Async        bool
+	Logger       interface{ Printf(string, ...any) }
+	LogPublisher LogPublisher
 }
 
 type stateSyncNode struct {
-	id      string
-	deps    []string
-	writer  cache.IntentWriter
-	timeout time.Duration
-	async   bool
-	logger  interface{ Printf(string, ...any) }
+	id           string
+	deps         []string
+	writer       cache.IntentWriter
+	timeout      time.Duration
+	async        bool
+	logger       interface{ Printf(string, ...any) }
+	logPublisher LogPublisher
 }
 
 func NewStateSyncNode(opts StateSyncNodeOptions) Node {
@@ -37,12 +39,13 @@ func NewStateSyncNode(opts StateSyncNodeOptions) Node {
 		timeout = defaultStateSyncTimeout
 	}
 	return &stateSyncNode{
-		id:      id,
-		deps:    append([]string(nil), opts.Deps...),
-		writer:  opts.Writer,
-		timeout: timeout,
-		async:   opts.Async,
-		logger:  opts.Logger,
+		id:           id,
+		deps:         append([]string(nil), opts.Deps...),
+		writer:       opts.Writer,
+		timeout:      timeout,
+		async:        opts.Async,
+		logger:       opts.Logger,
+		logPublisher: opts.LogPublisher,
 	}
 }
 
@@ -91,6 +94,7 @@ func (n *stateSyncNode) Run(ctx context.Context, st *State) error {
 		if err := n.writer.WriteIntent(writeCtx, sessionID, vector, version); err != nil {
 			return err
 		}
+		publishDAGLog(writeCtx, n.logPublisher, sessionID, "[Redis写入成功] 慢轨意图向量已回写 Redis")
 		if clearReflection {
 			clearReflectionMetadata(st)
 		}

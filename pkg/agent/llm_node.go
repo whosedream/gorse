@@ -43,6 +43,7 @@ type NeuralNodeOptions struct {
 	MaxRetries    int
 	BaseBackoff   time.Duration
 	Logger        interface{ Printf(string, ...any) }
+	LogPublisher  LogPublisher
 }
 
 type neuralIntentNode struct {
@@ -53,6 +54,7 @@ type neuralIntentNode struct {
 	maxRetries    int
 	baseBackoff   time.Duration
 	logger        interface{ Printf(string, ...any) }
+	logPublisher  LogPublisher
 }
 
 // NewNeuralIntentNode creates a resilient neural intent extraction DAG node.
@@ -69,6 +71,7 @@ func NewNeuralIntentNode(opts NeuralNodeOptions) Node {
 		maxRetries:    opts.MaxRetries,
 		baseBackoff:   opts.BaseBackoff,
 		logger:        opts.Logger,
+		logPublisher:  opts.LogPublisher,
 	}
 }
 
@@ -87,10 +90,15 @@ func (n *neuralIntentNode) Run(ctx context.Context, st *State) error {
 		return ctx.Err()
 	default:
 	}
+	start := time.Now()
+	publishDAGLog(ctx, n.logPublisher, st.SessionID, "[LLM推理开始] 慢轨意图解构启动")
 	builder := n.promptBuilder
 	prompt, err := builder.Build(st)
 	if err != nil {
 		return err
+	}
+	if st.Metadata[MetadataReflectionActive] == "true" {
+		publishDAGLog(ctx, n.logPublisher, st.SessionID, "[反思触发] 检测到感知漂移反思上下文")
 	}
 	st.Prompt = prompt
 	attempts := n.maxRetries + 1
@@ -118,6 +126,7 @@ func (n *neuralIntentNode) Run(ctx context.Context, st *State) error {
 				if payload.BaselineVersion > 0 {
 					st.BaselineVersion = payload.BaselineVersion
 				}
+				publishDAGLog(ctx, n.logPublisher, st.SessionID, "[LLM推理完成] 意图解构完成 耗时="+time.Since(start).String())
 				return nil
 			}
 			if err == nil {

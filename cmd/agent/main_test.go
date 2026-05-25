@@ -97,7 +97,7 @@ func TestRunBatchBuildsDAGAndWritesIntentVector(t *testing.T) {
 		}},
 	}
 
-	if err := RunBatch(context.Background(), batch, mockLLM{}, mockEmbedder{}, writer); err != nil {
+	if err := RunBatch(context.Background(), batch, mockLLM{}, mockEmbedder{}, writer, nil); err != nil {
 		t.Fatalf("RunBatch returned error: %v", err)
 	}
 

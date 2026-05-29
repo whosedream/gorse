@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -21,6 +22,14 @@ type Product struct {
 	ImageURL  string
 	Score     float64
 	Embedding []float32
+}
+
+// SearchResult is a lightweight search result (no embedding) for hot-path
+// vector similarity queries. It avoids the heap allocation and parsing cost
+// of extracting the full embedding column.
+type SearchResult struct {
+	ItemID string
+	Score  float64
 }
 
 // DuckDBClient wraps a DuckDB database connection for vector similarity search.
@@ -85,7 +94,7 @@ func (c *DuckDBClient) InitProductCatalog(csvPath string) error {
 	if csvPath != "" {
 		return c.initFromCSV(csvPath)
 	}
-	return c.initPresetData()
+	return c.initBenchmarkData()
 }
 
 func (c *DuckDBClient) initFromCSV(csvPath string) error {
@@ -93,52 +102,98 @@ func (c *DuckDBClient) initFromCSV(csvPath string) error {
 	return err
 }
 
-func (c *DuckDBClient) initPresetData() error {
+// initBenchmarkData creates the products table with 125 products across
+// 5 categories (25 each) with FLOAT[1024] embedding vectors. Each category
+// has a bias in a dedicated 128-dim segment of the embedding space so that
+// vector similarity queries can separate categories.
+func (c *DuckDBClient) initBenchmarkData() error {
 	_, err := c.db.Exec(`
 		CREATE TABLE products (
 			item_id VARCHAR,
 			title VARCHAR,
 			category VARCHAR,
 			price DOUBLE,
-			image_url VARCHAR
+			image_url VARCHAR,
+			embedding FLOAT[1024]
 		)
 	`)
 	if err != nil {
 		return err
 	}
 
-	presets := []struct {
-		id, title, cat string
-		price          float64
-		image          string
-	}{
-		{"cat_001", "天然有机猫薄荷逗猫棒", "猫咪用品", 19.90, "https://img.alicdn.com/cat/catnip001.jpg"},
-		{"cat_002", "智能自动循环逗猫球USB充电", "猫咪用品", 49.90, "https://img.alicdn.com/cat/ball001.jpg"},
-		{"cat_003", "全封闭式超大猫砂盆防溅防臭", "猫咪用品", 89.00, "https://img.alicdn.com/cat/litterbox001.jpg"},
-		{"phone_001", "华为Mate 70 Pro昆仑玻璃512GB", "手机数码", 6999.00, "https://img.alicdn.com/phone/huawei001.jpg"},
-		{"phone_002", "小米15 Ultra徕卡影像16+512G", "手机数码", 6499.00, "https://img.alicdn.com/phone/xiaomi001.jpg"},
-		{"phone_003", "OPPO Find X7 Ultra卫星通信版", "手机数码", 5999.00, "https://img.alicdn.com/phone/oppo001.jpg"},
-		{"sport_001", "李宁超轻20代碳板跑鞋男款", "运动户外", 399.00, "https://img.alicdn.com/sport/shoe001.jpg"},
-		{"sport_002", "安踏C37 3.0软底缓震跑鞋", "运动户外", 349.00, "https://img.alicdn.com/sport/anta001.jpg"},
-		{"sport_003", "Keep智能计数跳绳蓝牙APP同步", "运动户外", 79.00, "https://img.alicdn.com/sport/rope001.jpg"},
-		{"book_001", "深入理解计算机系统原书第3版", "图书", 99.00, "https://img.alicdn.com/book/csapp001.jpg"},
-		{"book_002", "Go语言高级编程源码级剖析", "图书", 79.00, "https://img.alicdn.com/book/goadv001.jpg"},
-		{"book_003", "数据库系统内幕分布式存储设计", "图书", 89.00, "https://img.alicdn.com/book/db001.jpg"},
-		{"coffee_001", "隅田川进口意式浓缩挂耳黑咖啡24片", "咖啡茶饮", 39.90, "https://img.alicdn.com/coffee/sumi001.jpg"},
-		{"coffee_002", "瑞幸精品冻干即溶咖啡粉12颗装", "咖啡茶饮", 49.90, "https://img.alicdn.com/coffee/luckin001.jpg"},
-		{"coffee_003", "星巴克佛罗娜研磨咖啡粉250g", "咖啡茶饮", 69.00, "https://img.alicdn.com/coffee/starbucks001.jpg"},
+	categories := []string{"数码电子", "母婴用品", "宠物生活", "运动户外", "食品饮料"}
+	categoryPrefixes := map[string]string{
+		"数码电子": "dig",
+		"母婴用品": "baby",
+		"宠物生活": "pet",
+		"运动户外": "sport",
+		"食品饮料": "food",
+	}
+	catSegments := map[string][2]int{
+		"数码电子": {0, 127},
+		"母婴用品": {128, 255},
+		"宠物生活": {256, 383},
+		"运动户外": {384, 511},
+		"食品饮料": {512, 639},
 	}
 
-	for _, p := range presets {
-		_, err := c.db.Exec(
-			`INSERT INTO products (item_id, title, category, price, image_url) VALUES (?, ?, ?, ?, ?)`,
-			p.id, p.title, p.cat, p.price, p.image,
-		)
-		if err != nil {
-			return err
+	for _, cat := range categories {
+		pre := categoryPrefixes[cat]
+		seg := catSegments[cat]
+		for i := 0; i < 25; i++ {
+			itemID := fmt.Sprintf("%s_%03d", pre, i+1)
+			title := fmt.Sprintf("%s精选商品%03d", cat, i+1)
+			price := 10.00 + float64(i)*6.50
+			imageURL := fmt.Sprintf("https://img.example.com/%s/%03d.jpg", pre, i+1)
+
+			// Deterministic random from item_id hash.
+			seed := hashItemID(itemID)
+			embedding := make([]float32, 1024)
+			for j := range embedding {
+				v := xorshiftFloat32(&seed)
+				if j >= seg[0] && j <= seg[1] {
+					// Category bias: positive shift in segment.
+					embedding[j] = 0.05 + v*0.10
+				} else if j >= 640 {
+					// Upper dims: neutral noise.
+					embedding[j] = (v - 0.5) * 0.10
+				} else {
+					// Non-segment dims: near zero.
+					embedding[j] = (v - 0.5) * 0.05
+				}
+			}
+
+			embLiteral := vectorToSQLLiteral(embedding)
+			sql := fmt.Sprintf(`INSERT INTO products (item_id, title, category, price, image_url, embedding) VALUES (?, ?, ?, ?, ?, %s::FLOAT[1024])`, embLiteral)
+			if _, err := c.db.Exec(sql, itemID, title, cat, price, imageURL); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// hashItemID returns a 64-bit hash derived from item_id for deterministic
+// random vector generation.
+func hashItemID(s string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+// xorshiftFloat32 returns a pseudo-random float32 in [0,1) using xorshift64*.
+// state is updated in place; the sequence is deterministic given the initial seed.
+func xorshiftFloat32(state *uint64) float32 {
+	x := *state
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	*state = x
+	v := (x * 0x2545F4914F6CDD1D) & 0xFFFFFF
+	return float32(v) / float32(0x1000000)
 }
 
 // SearchWithIntent performs vector similarity search against the products table.
@@ -234,6 +289,60 @@ func (c *DuckDBClient) SearchWithIntent(ctx context.Context, vector []float32, c
 		return nil, err
 	}
 	return products, nil
+}
+
+// SearchByIntent performs lightweight vector similarity search without
+// fetching the embedding column. It returns SearchResult (ItemID + Score)
+// to avoid the heap allocation and parsing overhead of the full embedding
+// array on the hot path.
+func (c *DuckDBClient) SearchByIntent(ctx context.Context, vector []float32, category string, limit int) ([]SearchResult, error) {
+	if c == nil || c.db == nil {
+		return nil, errors.New("storage: client not initialized")
+	}
+	if len(vector) == 0 {
+		return nil, errors.New("storage: empty vector")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+
+	// Ensure embedding column exists (no-op if already present).
+	if err := c.ensureEmbeddingColumn(ctx); err != nil {
+		return nil, err
+	}
+
+	vecLiteral := vectorToSQLLiteral(vector)
+
+	query := `SELECT item_id,
+			array_dot_product(embedding, ` + vecLiteral + `::FLOAT[1024]) AS score
+			FROM products`
+
+	var args []interface{}
+	if category != "" {
+		query += ` WHERE category = ?`
+		args = append(args, category)
+	}
+	query += ` ORDER BY score DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []SearchResult
+	for rows.Next() {
+		var r SearchResult
+		if err := rows.Scan(&r.ItemID, &r.Score); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // ensureEmbeddingColumn adds an embedding column (FLOAT[1024]) with random

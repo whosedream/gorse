@@ -234,14 +234,18 @@ func TestGoroutinePoolExecutionBackpressureTimeoutAndScaling(t *testing.T) {
 			},
 		},
 		{
-			name: "idle shrink keeps at least min workers",
+			name: "fixed pool keeps constant worker count",
 			run: func(t *testing.T) {
-				gp, err := NewGoroutinePool(3, 6, 16)
+				gp, err := NewFixedPool(4, 16)
 				if err != nil {
-					t.Fatalf("NewGoroutinePool returned error: %v", err)
+					t.Fatalf("NewFixedPool returned error: %v", err)
 				}
 				defer gp.Shutdown(context.Background())
-				gp.idleTimeout.Store(int64(time.Millisecond))
+
+				// Workers are pre-spawned, count must be 4 from the start.
+				if got := gp.WorkerCount(); got != 4 {
+					t.Fatalf("worker count = %d, want 4", got)
+				}
 
 				block := make(chan struct{})
 				for i := 0; i < 12; i++ {
@@ -257,17 +261,12 @@ func TestGoroutinePoolExecutionBackpressureTimeoutAndScaling(t *testing.T) {
 						t.Fatalf("Submit returned error: %v", err)
 					}
 				}
-				deadline := time.Now().Add(time.Second)
-				for time.Now().Before(deadline) && gp.WorkerCount() <= 3 {
-					time.Sleep(time.Millisecond)
-				}
 				close(block)
-				deadline = time.Now().Add(time.Second)
-				for time.Now().Before(deadline) && gp.WorkerCount() > 3 {
-					time.Sleep(time.Millisecond)
-				}
-				if got := gp.WorkerCount(); got != 3 {
-					t.Fatalf("idle shrink crossed minWorkers: workers=%d", got)
+				// Wait for tasks to drain.
+				time.Sleep(10 * time.Millisecond)
+				// Fixed pool never shrinks.
+				if got := gp.WorkerCount(); got != 4 {
+					t.Fatalf("worker count = %d, want 4 (fixed pool)", got)
 				}
 			},
 		},
@@ -369,38 +368,46 @@ func TestGoroutinePoolExecutionBackpressureTimeoutAndScaling(t *testing.T) {
 			},
 		},
 		{
-			name: "queue above sixty percent expands workers",
+			name: "fixed pool rejects when queue is full",
 			run: func(t *testing.T) {
-				gp, err := NewGoroutinePool(1, 4, 10)
+				gp, err := NewFixedPool(1, 1)
 				if err != nil {
-					t.Fatalf("NewGoroutinePool returned error: %v", err)
+					t.Fatalf("NewFixedPool returned error: %v", err)
 				}
 				defer gp.Shutdown(context.Background())
 
 				block := make(chan struct{})
-				for i := 0; i < 7; i++ {
-					if err := gp.Submit(context.Background(), func(ctx context.Context) error {
-						select {
-						case <-block:
-							return nil
-						case <-ctx.Done():
-							return ctx.Err()
-						}
-					}); err != nil {
-						close(block)
-						t.Fatalf("Submit %d returned error: %v", i, err)
+				started := make(chan struct{})
+				// 1 worker picks up task immediately, 1 goes in queue.
+				if err := gp.Submit(context.Background(), func(ctx context.Context) error {
+					close(started)
+					select {
+					case <-block:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
 					}
+				}); err != nil {
+					t.Fatalf("Submit 0 returned error: %v", err)
 				}
-
-				deadline := time.Now().Add(time.Second)
-				for time.Now().Before(deadline) && gp.WorkerCount() < 2 {
-					time.Sleep(time.Millisecond)
+				<-started
+				// Queue has capacity 1, this fills it.
+				if err := gp.Submit(context.Background(), func(ctx context.Context) error {
+					select {
+					case <-block:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}); err != nil {
+					t.Fatalf("Submit 1 returned error: %v", err)
+				}
+				// Queue is full, next submit must be rejected.
+				err = gp.Submit(context.Background(), func(ctx context.Context) error { return nil })
+				if err != ErrOverloaded {
+					t.Fatalf("expected ErrOverloaded, got %v", err)
 				}
 				close(block)
-
-				if got := gp.WorkerCount(); got < 2 {
-					t.Fatalf("expected adaptive expansion, workers=%d", got)
-				}
 			},
 		},
 	}

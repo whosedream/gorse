@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"go-rec/internal/slow_track"
 	"go-rec/pkg/cache"
 	"go-rec/pkg/mq"
 )
@@ -25,6 +27,87 @@ func (mockLLM) Complete(ctx context.Context, req LLMRequest) (string, error) {
 		return "", errors.New("bad llm request")
 	}
 	return `{"session_id":"s-1","baseline_version":7,"category_weights":{"c-1":0.9},"intent_vector":[]}`, nil
+}
+
+// happyPathLLM returns category_weights only; the 1024-dim intent vector is
+// generated downstream by the embedding node.
+type happyPathLLM struct{}
+
+func (happyPathLLM) Complete(ctx context.Context, req LLMRequest) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+	v := map[string]any{
+		"session_id":       "s-happy",
+		"baseline_version": float64(42),
+		"category_weights": map[string]float32{"手机数码": 0.8, "运动户外": 0.2},
+		"intent_vector":    []float32{},
+	}
+	buf, _ := json.Marshal(v)
+	return " thinking 分析中… response" + string(buf), nil
+}
+
+// slowTrackMockClient returns controlled slow_track.Response values for
+// testing the slowTrackLLMAdapter independently of a real HTTP client.
+type slowTrackMockClient struct {
+	resp slow_track.Response
+	err   error
+}
+
+func (m slowTrackMockClient) Complete(_ context.Context, _ slow_track.Request) (slow_track.Response, error) {
+	return m.resp, m.err
+}
+
+func TestSlowTrackLLMAdapterMergesReasoningAndText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		resp     slow_track.Response
+		wantSub  string // substring expected in the merged output
+		wantFull string // exact output expected
+	}{
+		{
+			name: "text only, no reasoning",
+			resp: slow_track.Response{Text: `{"session_id":"s1","baseline_version":1,"category_weights":{},"intent_vector":[]}`, Reasoning: ""},
+			wantFull: `{"session_id":"s1","baseline_version":1,"category_weights":{},"intent_vector":[]}`,
+		},
+		{
+			name: "reasoning has JSON, text is empty",
+			resp: slow_track.Response{Text: "", Reasoning: `<think>... </think>{"session_id":"s2","baseline_version":2,"category_weights":{"c":0.5},"intent_vector":[]}`},
+			wantFull: `<think>... </think>{"session_id":"s2","baseline_version":2,"category_weights":{"c":0.5},"intent_vector":[]}`,
+		},
+		{
+			name:     "both present — prefer text content, no merge",
+			resp:     slow_track.Response{Text: `{"session_id":"s3","baseline_version":3,"category_weights":{},"intent_vector":[]}`, Reasoning: "<think>正在分析…</think>"},
+			wantFull: `{"session_id":"s3","baseline_version":3,"category_weights":{},"intent_vector":[]}`,
+		},
+		{
+			name: "both empty",
+			resp: slow_track.Response{Text: "", Reasoning: ""},
+			wantFull: "",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			adapter := slowTrackLLMAdapter{client: slowTrackMockClient{resp: tt.resp}}
+			got, err := adapter.Complete(context.Background(), LLMRequest{UserPrompt: "test", EnableCoT: true})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantFull != "" && got != tt.wantFull {
+				t.Fatalf("got %q, want %q", got, tt.wantFull)
+			}
+			if tt.wantSub != "" && !strings.Contains(got, tt.wantSub) {
+				t.Fatalf("output missing %q: %q", tt.wantSub, got)
+			}
+		})
+	}
 }
 
 type mockEmbedder struct{}
@@ -97,7 +180,7 @@ func TestRunBatchBuildsDAGAndWritesIntentVector(t *testing.T) {
 		}},
 	}
 
-	if err := RunBatch(context.Background(), batch, mockLLM{}, mockEmbedder{}, writer, nil); err != nil {
+	if err := RunBatch(context.Background(), batch, mockLLM{}, mockEmbedder{}, writer, nil, nil, nil); err != nil {
 		t.Fatalf("RunBatch returned error: %v", err)
 	}
 
@@ -197,5 +280,48 @@ func TestEnvExampleContainsLLMPlaceholders(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf(".env.example missing %s", want)
 		}
+	}
+}
+
+// TestRunBatchHappyPathLLMReturns1024DimVector verifies the full DAG
+// path when the LLM produces a valid 1024-dim intent vector on the first
+// attempt — no simulation fallback involved.
+func TestRunBatchHappyPathLLMReturns1024DimVector(t *testing.T) {
+	t.Parallel()
+
+	writer := newCaptureWriter(false)
+	batch := mq.Batch{
+		SessionID:       "s-happy",
+		UserID:          "u-1",
+		BaselineVersion: 42,
+		Events: []mq.Event{{
+			SessionID:  "s-happy",
+			UserID:     "u-1",
+			ItemID:     "i-1",
+			CategoryID: "手机数码",
+			Timestamp:  42,
+			Action:     "click",
+		}},
+	}
+
+	if err := RunBatch(context.Background(), batch, happyPathLLM{}, mockEmbedder{}, writer, nil, nil, nil); err != nil {
+		t.Fatalf("RunBatch returned error: %v", err)
+	}
+
+	select {
+	case <-writer.called:
+	default:
+		t.Fatal("writer was not called")
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.session != "s-happy" {
+		t.Fatalf("session mismatch: got %q, want s-happy", writer.session)
+	}
+	if writer.version != 42 {
+		t.Fatalf("version mismatch: got %d, want 42", writer.version)
+	}
+	if writer.vecLen != cache.IntentVectorDim {
+		t.Fatalf("vector dim mismatch: got %d, want %d", writer.vecLen, cache.IntentVectorDim)
 	}
 }

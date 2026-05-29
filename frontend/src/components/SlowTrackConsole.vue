@@ -116,10 +116,26 @@ function closeStream(): void {
 
 function openStream(): void {
   closeStream()
-  if (!props.sessionId) return
-  eventSource = new window.EventSource(`http://127.0.0.1:18080/stream?session_id=${encodeURIComponent(props.sessionId)}`)
+  if (!props.sessionId) {
+    console.warn('[SSE] 跳过连接: sessionId 为空')
+    return
+  }
+  const streamUrl = `http://127.0.0.1:18080/stream?session_id=${encodeURIComponent(props.sessionId)}`
+  console.log('[SSE] 正在建立连接, URL:', streamUrl)
+  eventSource = new window.EventSource(streamUrl)
+  eventSource.onopen = () => {
+    console.log('[SSE] 连接已成功建立')
+  }
+  eventSource.onerror = (err) => {
+    console.error('[SSE] 连接发生错误:', err)
+    // EventSource automatically reconnects; log readyState for diagnostics.
+    if (eventSource) {
+      console.log('[SSE] readyState:', eventSource.readyState, '(0=CONNECTING 1=OPEN 2=CLOSED)')
+    }
+  }
   eventSource.onmessage = (event) => {
     const line = event.data
+    console.log('[SSE] 收到消息:', line)
     lines.value.push(line)
     const phase = phaseForLine(line)
     if (phase > activePhase.value) {

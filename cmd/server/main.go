@@ -4,13 +4,13 @@ import (
 	"context"
 	"flag"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
@@ -19,6 +19,7 @@ import (
 	"go-rec/internal/rk/scorer"
 	"go-rec/pkg/agent"
 	"go-rec/pkg/cache"
+	"go-rec/pkg/catalog"
 	"go-rec/pkg/mq"
 	"go-rec/pkg/pool"
 )
@@ -53,6 +54,9 @@ func main() {
 	timeout := flag.Duration("timeout", 25*time.Millisecond, "request timeout")
 	flag.Parse()
 
+	// Gin release mode for production
+	gin.SetMode(gin.ReleaseMode)
+
 	cacheClient := cache.NewMemoryClient(cache.Options{Shards: 16, IOTimeout: 2 * time.Millisecond})
 	for i := int64(1); i <= 128; i++ {
 		cacheClient.Set(cache.Feature{ID: i, Vector: []float32{float32(i % 7), float32((i + 3) % 11)}, Category: "default", Brand: "default", Available: true})
@@ -61,24 +65,34 @@ func main() {
 	if err != nil {
 		log.Fatalf("coordinator: %v", err)
 	}
-	gp, err := pool.NewGoroutinePool(2, 8, 1024)
+
+	// Fixed 200-worker pool with 4096 queue capacity
+	gp, err := pool.NewFixedPool(200, 4096)
 	if err != nil {
 		log.Fatalf("pool: %v", err)
 	}
-	var behaviorProducer mq.Producer
+
+	// Behavior event transport: fanout to Kafka + Redis.
+	// Redis is always active; Kafka is wired when configured.
+	var kafkaProducer mq.Producer
 	if producer, err := mq.NewKafkaProducerFromEnv(); err == nil {
-		behaviorProducer = producer
+		kafkaProducer = producer
+		log.Printf("kafka producer ready")
 	} else {
-		log.Printf("kafka producer disabled: %v", err)
+		log.Printf("kafka producer skipped: %v", err)
 	}
+
 	var intentReader cache.IntentReader
 	redisClient := redis.NewClient(&redis.Options{Addr: envDefault("REDIS_ADDR", defaultRedisAddr), Password: os.Getenv("REDIS_PASSWORD"), DB: envInt("REDIS_DB", 0)})
 	if reader, err := cache.NewRedisIntentReader(cache.RedisIntentReaderOptions{Client: redisClient}); err == nil {
 		intentReader = reader
 	} else {
-		log.Printf("redis intent reader disabled: %v", err)
-		_ = redisClient.Close()
+		log.Printf("redis intent reader disabled (non-critical): %v", err)
 	}
+
+	redisProducer := mq.NewRedisProducer(redisClient, "behavior:events")
+	behaviorProducer := mq.NewFanoutProducer(kafkaProducer, redisProducer)
+	log.Printf("behavior events: kafka=%v redis=behavior:events (fanout)", kafkaProducer != nil)
 
 	ids := make([]int64, 128)
 	for i := range ids {
@@ -97,14 +111,19 @@ func main() {
 		IntentReader:     intentReader,
 		ProductSearch:    initDuckDB(),
 		RedisClient:      redisClient,
+		Catalog:          catalog.New(""),
 	})
 	if err != nil {
 		log.Fatalf("api: %v", err)
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: gateway.Handler(), ReadHeaderTimeout: time.Second}
+	// Build Gin engine with middleware and routes
+	r := gateway.SetupRouter()
+
+	srv := &gin.Engine{}
+	_ = srv // unused, we use r directly
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := r.Run(*addr); err != nil {
 			log.Fatalf("listen: %v", err)
 		}
 	}()
@@ -113,14 +132,10 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("http shutdown: %v", err)
-	}
+	log.Printf("shutting down...")
 	if behaviorProducer != nil {
 		if err := behaviorProducer.Close(); err != nil {
-			log.Printf("kafka producer close: %v", err)
+			log.Printf("behavior producer close: %v", err)
 		}
 	}
 	if redisClient != nil {
@@ -128,10 +143,10 @@ func main() {
 			log.Printf("redis client close: %v", err)
 		}
 	}
-	if err := coord.Shutdown(ctx); err != nil {
+	if err := coord.Shutdown(context.Background()); err != nil {
 		log.Printf("coordinator shutdown: %v", err)
 	}
-	if err := gp.Shutdown(ctx); err != nil {
+	if err := gp.Shutdown(context.Background()); err != nil {
 		log.Printf("pool shutdown: %v", err)
 	}
 }

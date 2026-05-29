@@ -1,0 +1,4 @@
+item_id,title,category,price,image_url
+test_001,测试商品一,数码电子,99.50,https://example.com/img1.jpg
+test_002,测试商品二,母婴用品,199.00,https://example.com/img2.jpg
+test_003,测试商品三,数码电子,299.00,broken_price_format_should_fallback,

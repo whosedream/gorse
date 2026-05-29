@@ -1,4 +1,4 @@
-﻿package slow_track
+package slow_track
 
 import (
 	"bytes"
@@ -100,7 +100,7 @@ func NewClientFromEnv() *Client {
 func normalizeChatEndpoint(raw string) string {
 	endpoint := strings.TrimRight(strings.TrimSpace(raw), "/")
 	if endpoint == "" {
-		endpoint = "https://api.deepseek.com/v1"
+		endpoint = "https://api.deepseek.com"
 	}
 	if strings.HasSuffix(endpoint, "/chat/completions") {
 		return endpoint
@@ -113,20 +113,29 @@ type wireMessage struct {
 	Content string `json:"content"`
 }
 
+type thinkingConfig struct {
+	Type string `json:"type"`
+}
+
 type wireRequest struct {
-	Model        string        `json:"model"`
-	SystemPrompt string        `json:"system_prompt,omitempty"`
-	UserPrompt   string        `json:"user_prompt,omitempty"`
-	Messages     []wireMessage `json:"messages,omitempty"`
-	EnableCoT    bool          `json:"enable_cot"`
-	Reasoning    bool          `json:"reasoning"`
-	CacheKey     string        `json:"cache_key,omitempty"`
+	Model    string          `json:"model"`
+	Messages []wireMessage   `json:"messages"`
+	Stream   bool            `json:"stream"`
+	MaxTokens int            `json:"max_tokens,omitempty"`
+	Thinking *thinkingConfig `json:"thinking,omitempty"`
 }
 
 type wireResponse struct {
-	Text      string `json:"text"`
-	Reasoning string `json:"reasoning"`
-	Cached    bool   `json:"cached"`
+	Choices []struct {
+		Message struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"message"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
 // Complete calls the model endpoint. It retries 5xx/429/network failures and
@@ -191,7 +200,13 @@ func (c *Client) doComplete(ctx context.Context, req Request) (Response, bool, e
 		if err := json.Unmarshal(payload, &wr); err != nil {
 			return Response{}, false, err
 		}
-		return Response{Text: wr.Text, Reasoning: wr.Reasoning, Cached: wr.Cached}, false, nil
+		var text, reasoning string
+		if len(wr.Choices) > 0 {
+			text = wr.Choices[0].Message.Content
+			reasoning = wr.Choices[0].Message.ReasoningContent
+		}
+		cached := wr.Usage.PromptTokens > 0 && wr.Usage.CompletionTokens == 0
+		return Response{Text: text, Reasoning: reasoning, Cached: cached}, false, nil
 	}
 	statusErr := fmt.Errorf("deepseek status %d: %s", httpResp.StatusCode, string(payload))
 	if httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500 {
@@ -201,11 +216,21 @@ func (c *Client) doComplete(ctx context.Context, req Request) (Response, bool, e
 }
 
 func makeWireRequest(req Request, model string) wireRequest {
-	messages := make([]wireMessage, len(req.Messages))
-	for i, msg := range req.Messages {
-		messages[i] = wireMessage{Role: msg.Role, Content: msg.Content}
+	var messages []wireMessage
+	if req.SystemPrompt != "" {
+		messages = append(messages, wireMessage{Role: "system", Content: req.SystemPrompt})
 	}
-	return wireRequest{Model: model, SystemPrompt: req.SystemPrompt, UserPrompt: req.UserPrompt, Messages: messages, EnableCoT: req.EnableCoT, Reasoning: req.EnableCoT, CacheKey: req.CacheKey}
+	if req.UserPrompt != "" {
+		messages = append(messages, wireMessage{Role: "user", Content: req.UserPrompt})
+	}
+	for _, msg := range req.Messages {
+		messages = append(messages, wireMessage{Role: msg.Role, Content: msg.Content})
+	}
+	wr := wireRequest{Model: model, Messages: messages, Stream: false, MaxTokens: 4096}
+	if req.EnableCoT {
+		wr.Thinking = &thinkingConfig{Type: "enabled"}
+	}
+	return wr
 }
 
 func (c *Client) allow() error {

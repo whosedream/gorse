@@ -27,37 +27,56 @@ type queuedTask struct {
 	fn  Task
 }
 
-// GoroutinePool is a bounded worker pool with explicit non-blocking backpressure
-// and adaptive worker expansion when queue waterline reaches 60%.
+// GoroutinePool is a fixed-size bounded worker pool with non-blocking
+// backpressure. All workers are pre-spawned at creation time; the queue
+// has a fixed capacity. When the queue is saturated, Submit returns
+// ErrOverloaded immediately without blocking.
 type GoroutinePool struct {
 	queue        chan queuedTask
 	stop         chan struct{}
 	shutdownDone chan struct{}
-	minWorkers   int32
-	maxWorkers   int32
-	idleTimeout  atomic.Int64
+	workerCount  int
 	closed       atomic.Bool
-	workers      atomic.Int32
 	wg           sync.WaitGroup
 	acceptMu     sync.RWMutex
 	shutdownOnce sync.Once
 }
 
+// NewFixedPool creates a pool with exactly workerCount pre-spawned workers
+// and a queue of queueCap capacity. This is the preferred constructor for
+// the production gateway path (200 workers, 4096 queue).
+func NewFixedPool(workerCount, queueCap int) (*GoroutinePool, error) {
+	if workerCount <= 0 || queueCap <= 0 {
+		return nil, ErrInvalidPoolConfig
+	}
+	p := &GoroutinePool{
+		queue:       make(chan queuedTask, queueCap),
+		stop:        make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		workerCount: workerCount,
+	}
+	for i := 0; i < workerCount; i++ {
+		p.wg.Add(1)
+		go p.worker()
+	}
+	return p, nil
+}
+
 // NewGoroutinePool starts minWorkers workers and allocates a fixed queue.
+// Kept for backward compatibility with existing callers.
 func NewGoroutinePool(minWorkers, maxWorkers, queueCap int) (*GoroutinePool, error) {
 	if minWorkers <= 0 || maxWorkers < minWorkers || queueCap <= 0 {
 		return nil, ErrInvalidPoolConfig
 	}
 	p := &GoroutinePool{
-		queue:        make(chan queuedTask, queueCap),
-		stop:         make(chan struct{}),
+		queue:       make(chan queuedTask, queueCap),
+		stop:        make(chan struct{}),
 		shutdownDone: make(chan struct{}),
-		minWorkers:   int32(minWorkers),
-		maxWorkers:   int32(maxWorkers),
+		workerCount: minWorkers,
 	}
-	p.idleTimeout.Store(int64(time.Minute))
 	for i := 0; i < minWorkers; i++ {
-		p.spawnWorker()
+		p.wg.Add(1)
+		go p.worker()
 	}
 	return p, nil
 }
@@ -79,11 +98,9 @@ func (p *GoroutinePool) Submit(ctx context.Context, fn Task) error {
 	if p.closed.Load() {
 		return ErrPoolClosed
 	}
-	p.maybeScaleLocked()
 	qt := queuedTask{ctx: ctx, fn: fn}
 	select {
 	case p.queue <- qt:
-		p.maybeScaleLocked()
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -94,7 +111,7 @@ func (p *GoroutinePool) Submit(ctx context.Context, fn Task) error {
 
 // WorkerCount returns the currently live worker count.
 func (p *GoroutinePool) WorkerCount() int {
-	return int(p.workers.Load())
+	return p.workerCount
 }
 
 // QueueLen returns the queued task count.
@@ -122,86 +139,15 @@ func (p *GoroutinePool) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (p *GoroutinePool) maybeScaleLocked() {
-	capQ := cap(p.queue)
-	if capQ == 0 || len(p.queue)*100 < capQ*60 {
-		return
-	}
-	if p.closed.Load() {
-		return
-	}
-	p.trySpawnWorker()
-}
-
-func (p *GoroutinePool) spawnWorker() {
-	p.workers.Add(1)
-	p.wg.Add(1)
-	go p.worker()
-}
-
-func (p *GoroutinePool) trySpawnWorker() bool {
-	for {
-		current := p.workers.Load()
-		if current >= p.maxWorkers {
-			return false
-		}
-		if p.workers.CompareAndSwap(current, current+1) {
-			p.wg.Add(1)
-			go p.worker()
-			return true
-		}
-	}
-}
-
-func (p *GoroutinePool) idleDuration() time.Duration {
-	return time.Duration(p.idleTimeout.Load())
-}
-
 func (p *GoroutinePool) worker() {
-	counted := true
-	defer func() {
-		if counted {
-			p.workers.Add(-1)
-		}
-		p.wg.Done()
-	}()
-	idle := time.NewTimer(p.idleDuration())
-	defer idle.Stop()
+	defer p.wg.Done()
 	for {
 		select {
 		case <-p.stop:
 			p.drainQueue()
 			return
 		case task := <-p.queue:
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
 			runTask(task)
-			idle.Reset(p.idleDuration())
-		case <-idle.C:
-			if p.closed.Load() {
-				return
-			}
-			if p.retireIdleWorker() {
-				counted = false
-				return
-			}
-			idle.Reset(p.idleDuration())
-		}
-	}
-}
-
-func (p *GoroutinePool) retireIdleWorker() bool {
-	for {
-		current := p.workers.Load()
-		if current <= p.minWorkers {
-			return false
-		}
-		if p.workers.CompareAndSwap(current, current-1) {
-			return true
 		}
 	}
 }

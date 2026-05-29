@@ -18,6 +18,13 @@ type Product struct {
 	Embedding []float32
 }
 
+// SearchResult is a lightweight search result (no embedding) for hot-path
+// vector similarity queries.
+type SearchResult struct {
+	ItemID string
+	Score  float64
+}
+
 // DuckDBClient is unavailable when CGO is disabled.
 type DuckDBClient struct{}
 
@@ -36,5 +43,9 @@ func (c *DuckDBClient) SearchBaseline(context.Context, string, int) ([]Product, 
 }
 
 func (c *DuckDBClient) SearchWithIntent(context.Context, []float32, string, int) ([]Product, error) {
+	return nil, errors.New("storage: duckdb requires cgo")
+}
+
+func (c *DuckDBClient) SearchByIntent(context.Context, []float32, string, int) ([]SearchResult, error) {
 	return nil, errors.New("storage: duckdb requires cgo")
 }

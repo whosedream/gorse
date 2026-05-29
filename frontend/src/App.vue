@@ -6,7 +6,7 @@
           <p class="eyebrow">Go-Rec Dual Track Reranking</p>
           <h1>快轨不降速，慢轨懂意图</h1>
           <p class="subtitle">
-            点击任意商品后，慢轨模拟 DeepSeek 推理并回写热特征缓存；左侧快轨调用真实 /rerank API，商品网格按后端结果自动重排。
+            点击商品后，快轨即时重排 (&lt;25ms)；慢轨通过 Redis Pub/Sub 异步泵送事件至独立 Agent 进程，执行意图解构 DAG 并回写热特征缓存。
           </p>
         </div>
         <div class="metric-row">
@@ -50,16 +50,17 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import ProductGrid from './components/ProductGrid.vue'
 import SlowTrackConsole from './components/SlowTrackConsole.vue'
-import { getProductCatalog } from './mock/products'
-import type { ProductItem, RerankMode, RerankResponse, RerankStatus } from './types/product'
+import type { MetaItem, ProductItem, RerankMode, RerankResponse, RerankStatus } from './types/product'
+
+const API_BASE = 'http://127.0.0.1:18080'
+const INITIAL_ID_COUNT = 50
 
 const phaseLabels = ['行为泵送', 'LLM意图解构', '向量化降维', 'Redis状态同步回写']
 
-const catalog = getProductCatalog()
-const products = ref<ProductItem[]>(catalog)
+const products = ref<ProductItem[]>([])
 const selectedId = ref<string | null>(null)
 const status = ref<RerankStatus>('idle')
 const runId = ref(0)
@@ -94,66 +95,101 @@ function createExperimentSessionId(): string {
   return '00000000-0000-4000-8000-000000000003'
 }
 
-function productForResult(result: RerankResponse['results'][number], index: number): ProductItem {
-  const backendId = String(result.id)
-  const metadata = catalog.find((product) => product.item_id === backendId) ?? catalog[index % catalog.length]
+function metaToProduct(item: MetaItem): ProductItem {
   return {
-    ...metadata,
-    item_id: backendId,
-    title: metadata ? `${metadata.title} · #${backendId}` : `Backend Result #${backendId}`,
-    score: result.score,
-    rank: index + 1,
+    item_id: item.id,
+    title: item.title,
+    category: item.category,
+    price: item.price,
+    image_url: item.image_url,
   }
 }
 
-function applyRerankResults(response: RerankResponse): void {
-  if (response.results.length === 0) {
-    return
+async function loadInitialCatalog(): Promise<void> {
+  try {
+    const idsResp = await window.fetch(`${API_BASE}/products/ids`)
+    if (!idsResp.ok) return
+    const allIDs = (await idsResp.json()) as string[]
+    const batch = allIDs.slice(0, INITIAL_ID_COUNT)
+    if (batch.length === 0) return
+    const metaResp = await window.fetch(`${API_BASE}/products/meta?ids=${batch.join(',')}`)
+    if (!metaResp.ok) return
+    const data = (await metaResp.json()) as MetaItem[]
+    if (data.length > 0) {
+      products.value = data.map((item, i) => ({ ...metaToProduct(item), rank: i + 1 }))
+    }
+  } catch {
+    // catalog unavailable; keep empty grid
   }
+}
 
-  const orderedProducts = response.results.map((result, index) => productForResult(result, index))
+async function fetchMetaItems(ids: string[]): Promise<Map<string, MetaItem>> {
+  if (ids.length === 0) return new Map()
+  const query = ids.slice(0, 50).join(',')
+  const resp = await window.fetch(`${API_BASE}/products/meta?ids=${query}`)
+  if (!resp.ok) return new Map()
+  const data = (await resp.json()) as MetaItem[]
+  return new Map(data.map((item) => [item.id, item]))
+}
 
-  if (orderedProducts.length > 0) {
-    products.value = orderedProducts
+async function fetchRerank(product: ProductItem): Promise<RerankResponse> {
+  const response = await window.fetch(`${API_BASE}/rerank`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: sessionId,
+      version_stamp: Date.now(),
+      item_id: product.item_id,
+      slots: {
+        category: product.category,
+        brand: product.brand ?? 'default',
+      },
+    }),
+  })
+  if (!response.ok) {
+    throw new Error(`Rerank request failed: ${response.status}`)
   }
-  rerankMode.value = response.fallback || !response.intent_hit ? 'fallback' : 'ai-hit'
+  return (await response.json()) as RerankResponse
 }
 
 async function handleProductSelect(product: ProductItem): Promise<void> {
-  if (isBusy.value) {
-    return
-  }
+  if (isBusy.value) return
 
   selectedId.value = product.item_id
   status.value = 'streaming'
   rerankMode.value = 'baseline'
-  products.value = catalog
   activePhase.value = 0
   runId.value += 1
 
   try {
     status.value = 'reranking'
-    const response = await window.fetch('http://127.0.0.1:18080/rerank', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: sessionId,
-        version_stamp: Date.now(),
-        item_id: product.item_id,
-        slots: {
-          category: product.category,
-          brand: product.brand ?? 'default',
-        },
-      }),
+
+    const rerankResp = await fetchRerank(product)
+
+    const rerankedIDs = rerankResp.results.map((r) => String(r.id))
+    const metaMap = await fetchMetaItems(rerankedIDs)
+
+    const merged = rerankResp.results.map((result, index) => {
+      const id = String(result.id)
+      const meta = metaMap.get(id)
+      return {
+        item_id: id,
+        title: meta?.title ?? `Product #${id}`,
+        category: meta?.category ?? '',
+        price: meta?.price ?? 0,
+        image_url: meta?.image_url ?? '',
+        score: result.score,
+        rank: index + 1,
+      }
     })
 
-    if (!response.ok) {
-      throw new Error(`Rerank request failed: ${response.status}`)
+    if (merged.length > 0) {
+      products.value = merged
     }
-
-    applyRerankResults((await response.json()) as RerankResponse)
+    rerankMode.value = rerankResp.fallback || !rerankResp.intent_hit ? 'fallback' : 'ai-hit'
   } catch (error) {
     console.error('Failed to fetch rerank results', error)
+  } finally {
     status.value = 'idle'
     activePhase.value = -1
   }
@@ -163,6 +199,10 @@ function handleConsoleComplete(): void {
   status.value = 'complete'
   activePhase.value = 3
 }
+
+onMounted(() => {
+  void loadInitialCatalog()
+})
 </script>
 
 <style scoped>

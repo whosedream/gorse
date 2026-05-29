@@ -1,141 +1,132 @@
 # Go-Rec — 电商 AI 双轨重排系统
 
-Go-Rec 是一个 Go 实现的电商智能导购重排系统。核心目标是在在线快轨保持 P99 ≤ 25ms 的同时，把多轮行为理解、LLM 意图推断、Embedding 向量化和 Redis 热特征回写放到异步慢轨中执行。
+Go-Rec 是一个 Go 实现的电商智能导购重排系统。核心目标是：**在线快轨严守 P99 ≤ 25ms** 的同时，把**多轮行为理解、LLM 意图推断、Embedding 向量化和 Redis 热特征回写**全部异步化到慢轨进程，让大模型的深度推理能力为下一次点击提供真实可观测的意图增强排序。
+
+前后端已经端到端打通：浏览器点击商品后，左侧瀑布流瞬间 (<25ms) 重排，右侧开发者控制台流式输出 Agent 进程的 LLM 思维链 / 分类权重 / 向量生成 / Redis 写入实时事件。
 
 ## 当前状态
 
-已实现：
+### 全链路已联通
 
-- 快轨 HTTP 网关：手写 FSM JSON 解析、对象池复用、有界协程池、过载显式降级。
-- 快轨 A/B 分流：基于 SessionID 的 FNV-1a 稳定分桶。
-  - `baseline`：跳过 Redis intent，直接走 DuckDB baseline 检索。
-  - `neuro_rerank`：Redis intent → DuckDB intent search → 本地缓存 fallback。
-- API 可观测字段：`/rerank` 响应包含 `fallback` 和 `intent_hit`。
-  - `fallback` 表示重排/底库路径是否使用 fallback。
-  - `intent_hit` 表示本次是否命中 Redis/LLM 意图向量。
-- 本地 CORS：允许 Vite dev origin `http://127.0.0.1:5173` / `http://localhost:5173` 访问 `/rerank`。
-- Redis IntentReader L1：Ristretto + 固定 hot table，命中路径 0 allocs/op，TTL 5 分钟。
-- 慢轨 Agent DAG：Kafka batch → PromptBuilder → LLM JSON 清洗 → Embedding → StateSync Redis。
-- Reflection 机制：当上一轮意图与当前点击类目明显背离时，在 prompt 中注入反思指令，并保持最终 JSON 契约不变。
-- DuckDB 集成：支持带 intent vector 的商品检索；非 CGO/无 DuckDB 环境下有 no-cgo stub，默认构建不阻塞。
-- Vue 3 控制台：当前是本地 mock 演示 UI，可展示商品网格和慢轨打字机日志。
+- **行为事件泵送**：快轨 `/rerank` 处理完后用裸 goroutine（非有界池）将 `mq.Event{session_id, user_id, item_id, category_id, ...}` `PUBLISH` 到 Redis Pub/Sub `behavior:events` 频道，发布严禁阻塞 25ms 红线。
+- **Kafka + Redis 双发**：`FanoutProducer` 并行（`sync.WaitGroup`）向 Kafka 与 Redis 发布事件，Kafka 异步写入失败不阻塞 Redis 路径。
+- **Agent 慢轨守护进程**：独立的 `cmd/agent` 进程通过 `RedisEventSource` + `WindowConsumer` 订阅 `behavior:events`，每条事件实例化 `neural_intent → embedding → state_sync` DAG。
+- **SSE 实时日志通道**：DAG 各节点通过 `RedisLogPublisher` 推送到 `sse_log:<session_id>`，`GET /stream?session_id=...` 端点订阅 Redis Pub/Sub 并以 SSE 格式回推前端。
+- **完整 LLM 推理可观测**：成功路径下，SSE 推送的不只是阶段标记，而是 LLM 原始 JSON 输出（含 `category_weights`）+ 排序后的人类可读分类权重，配合反思触发标记。
+- **前端真实联调**：`frontend/src/App.vue` 通过 `EventSource` 接入 `/stream`，点击商品 → POST `/rerank`（携带 `item_id` 与 `user_id`）→ 快轨重排可视化 + 慢轨打字机式日志，无任何 mock。
 
-已知缺口：
+### 快轨主路径
 
-- 前端当前没有真实 `fetch` / SSE / WebSocket 联调，商品重排和慢轨日志仍由 mock 数据与 `setTimeout` / `setInterval` 驱动。
-- 慢轨真实可观测流（Kafka → DeepSeek → Redis 的日志流）尚未暴露给前端。
-- 如需浏览器真实联调，应新增前端 API client 与后端 SSE/WebSocket 或轮询接口。
+- **手写 FSM JSON 解析**：单字节状态机，对象池复用 `requestState`/`parseState`，0 allocs/op。
+- **A/B 分流**：基于 SessionID 的 FNV-1a 稳定分桶（`0~49 → baseline`，`50~99 → neuro_rerank`）。
+- **意图三层降级**：
+  1. Redis 慢轨预热向量（`IntentReader` L1 + Ristretto，命中路径 0 allocs）
+  2. DuckDB intent search + Scorer 并行余弦打分
+  3. 本地 MemoryClient + Coordinator 默认意图兜底
+  4. Catalog 静态序列彻底兜底
+- **过载防御**：`MaxInFlight` 信号量 + 25ms 上下文超时；池满显式抛 `ErrOverloaded`，不排队不阻塞。
+
+### 慢轨主路径
+
+- **PromptBuilder**：行为日志压缩 → XML 风格 `<system_directive>` / `<behavior_log>` / `<reasoning_protocol>` / `<output_schema>` 注入。
+- **反思机制**：旧意图与最新点击品类背离时注入 `<reflection_instruction>`，强制 JSON 契约不变，输出 reflection_active 元数据。
+- **JSON 清洗**：`CleanModelJSON` 用 `IndexByte('{')` + `LastIndexByte('}')` 截取，鲁棒处理 DeepSeek 的 `<think>` 噪声与 ```` ```json ```` 包裹。
+- **意图载荷校验**：要求 `session_id != ""` 且 `len(category_weights) > 0`，否则触发重试 / 模拟降级。
+- **远程 Embedding**：通过 SiliconFlow BAAI/bge-m3 生成 1024 维向量，Embedding 节点失败时本地确定性回退。
+- **StateSync**：Lua 原子脚本写入 Redis，TTL 5 分钟。
 
 ## 核心架构
 
 ```
-  ┌────────── 快轨 (P99 ≤ 25ms) ──────────┐
-  │  HTTP → FSM 解析 → A/B 分桶 →          │
-  │  Redis L1/L2 Intent → DuckDB/Scorer → │
-  │  JSON 响应(fallback + intent_hit)      │
-  └──────────────────┬────────────────────┘
-                     │ Kafka Async Producer
-  ┌────────── 慢轨 (150-800ms) ──────────┐
-  │  Kafka Consume → Agent DAG           │
-  │  → Reflection Prompt → LLM JSON 清洗 │
-  │  → BGE-M3 Embedding → StateSync      │
-  │  → Redis Lua 原子写入                │
-  └───────────────────────────────────────┘
+                              ┌──────────────────────────────────────────┐
+   浏览器点击商品               │  快轨 (P99 ≤ 25ms)                       │
+   POST /rerank ─────────────► │  FSM 解析 → A/B 分桶 →                   │
+                              │  Redis L1/L2 Intent → DuckDB/Scorer →    │
+   ◄───── JSON 响应 ─────────── │  (fallback + intent_hit)                  │
+                              └────────────┬─────────────────────────────┘
+                                           │
+                                           │ 裸 goroutine 异步发布
+                                           ▼
+                              ┌──────────────────────────────────────────┐
+                              │  FanoutProducer (并行)                    │
+                              │   ├─► Kafka  (rk_behavior_log)           │
+                              │   └─► Redis  Pub/Sub  behavior:events    │
+                              └────────────┬─────────────────────────────┘
+                                           │
+                                           ▼
+                              ┌──────────────────────────────────────────┐
+   GET /stream                │  慢轨 Agent (150-800ms LLM + Embedding)   │
+   SSE EventSource ◄──────────┤  WindowConsumer → DAG:                   │
+                              │    ① NeuralIntentNode (DeepSeek + 反思)   │
+                              │    ② EmbeddingNode  (BGE-M3 1024dim)     │
+                              │    ③ StateSyncNode  (Redis Lua 原子写入)  │
+                              │  每节点 publish 到 sse_log:<session_id>   │
+                              └──────────────────────────────────────────┘
+                                           │
+                                           ▼ (下次 rerank 即可命中)
+                                  Redis intent vector 热预热
 ```
 
-## 关键数字
+## 重排逻辑全景
 
-| 指标 | 数值 |
-|---|---:|
-| FSM JSON 解析 | 395 ns/op · 0 allocs |
-| Intent 向量解码 | 约 240-260 ns/op · 0 allocs |
-| RedisIntentReader L1 命中 | 约 40-50 ns/op · 0 allocs |
-| Scorer 打分 | 37 μs/op · 0 allocs |
-| 全链路 Pipeline P99 | 1.0 ms |
-| Taobao 1亿条压测 P99 | 13.2 ms |
-| Taobao 1亿条压测 QPS | 25,175 |
-| Amazon 782万条压测 P99 | 9.3 ms |
-
-## 快速开始
-
-### 后端
-
-```powershell
-# 可选：启动依赖
-docker compose up -d kafka
-docker run -d --name go-rec-redis -p 6379:6379 redis:7-alpine
-
-# 默认非 DuckDB CGO 构建，Redis 默认地址为 127.0.0.1:6379
-$env:REDIS_ADDR = "127.0.0.1:6379"
-go run ./cmd/server -addr 127.0.0.1:8080
-```
-
-### API 冒烟
-
-```powershell
-$body = '{"session_id":"123e4567-e89b-12d3-a456-426614174000","version_stamp":1710000000123,"slots":{"category":"phone","brand":"acme"}}'
-Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://127.0.0.1:8080/rerank" -ContentType "application/json" -Body $body
-```
-
-响应会包含：
-
-```json
-{
-  "session_id": "...",
-  "fallback": false,
-  "intent_hit": false,
-  "results": []
-}
-```
-
-### 前端
-
-```powershell
-npm --prefix frontend install
-npm --prefix frontend run dev -- --host 127.0.0.1 --port 5173
-```
-
-打开：`http://127.0.0.1:5173/`
-
-## 测试
-
-```powershell
-# Go 全量非 CGO 测试
-go test ./...
-
-# 快轨 / 慢轨重点包
-go test ./api ./pkg/agent ./pkg/cache ./cmd/server ./cmd/agent
-
-# 前端类型检查与构建
-npm --prefix frontend run typecheck
-npm --prefix frontend run build
-```
-
-## 目录
+### 流量分桶
 
 ```
-/pkg/fsm      手写 FSM JSON 解析器
-/pkg/pool     泛型对象池 · 有界协程池 · 4KB 字节池
-/pkg/cache    内存缓存 · Redis Intent 读写 · Ristretto L1
-/pkg/mq       Kafka Producer/Consumer
-/pkg/agent    DAG 引擎 · Reflection Prompt · LLM 清洗 · Embedding · StateSync
-/pkg/storage  DuckDB 向量检索客户端
-/internal     快轨 scorer + anti_drift · DeepSeek HTTP 客户端
-/api          HTTP 网关 · A/B 分流 · CORS · intent_hit 响应
-/cmd          快轨 server + 慢轨 agent 入口
-/frontend     Vue 3 控制台，目前为 mock 演示 UI
-/test         流式压测回放器
+SessionID → FNV-1a hash % 100
+  ├── 0~49  → baseline    (50%)
+  └── 50~99 → neuro_rerank (50%)
 ```
 
-## 本地配置
+### 路径 A：baseline（无意图，纯搜索）
 
-`.env` 不应提交；`.env.example` 保留可提交模板。
-
-关键默认值：
-
-```env
-REDIS_ADDR=127.0.0.1:6379
-KAFKA_BROKERS=localhost:9092
-KAFKA_TOPIC=rk_behavior_log
-KAFKA_GROUP_ID=rk_slow_track
 ```
+POST /rerank → 提取 category → DuckDB.SearchBaseline()
+  ├── 成功      → fallback=false, intent_hit=false
+  └── 失败/缺失 → Catalog 兜底 → fallback=true,  intent_hit=false
+```
+
+### 路径 B：neuro_rerank（意图驱动，三层降级）
+
+```
+POST /rerank
+  │
+  ├── ① Redis 读取慢轨预热的 intent vector（2ms timeout）
+  │    │
+  │    ├── 命中  → DuckDB.SearchWithIntent(vector, category)
+  │    │         → Scorer.Rank() → fallback=false, intent_hit=true   ← 最优
+  │    └── 未命中/超时 → ②
+  │
+  ├── ② Cache Fallback（本地内存打分）
+  │    │
+  │    ├── Coordinator.Get(sessionID) 查本地特征记录
+  │    │   ├── 有记录 → 用 IntentVector 打分
+  │    │   └── 无记录 → fillDefaultIntent(category, brand) 默认向量
+  │    └── MemoryClient.MGet → Scorer.RankParallel → 返回
+  │
+  └── ③ Catalog 兜底（路径全断时）
+```
+
+### 打分引擎
+
+```
+所有候选商品 × intent vector → 余弦相似度
+  → selectTopK (取 Top 20)
+  → fillDiverseResults (滑动窗口 5, 同 category ≤ 3, 同 brand ≤ 3)
+```
+
+### 响应字段
+
+| 字段 | 含义 |
+|---|---|
+| `fallback` | 是否走了 catalog / 默认向量 等降级路径 |
+| `intent_hit` | 是否命中 Redis 中由慢轨预热的 LLM 意图向量 |
+
+## SSE 事件流（开发者控制台）
+
+```
+[LLM推理开始] 慢轨意图解构启动
+[反思触发]   检测到感知漂移反思上下文        ← 仅当 metadata.reflection_active=true
+{"session_id":"...","category_weights":{"咖啡茶饮":1.0}}   ← LLM 原始 JSON
+[意图解构]   分类权重: 咖啡茶饮:1.00          ← 格式化后
+[LLM推理完成] 意图解构完成 耗时=4.5s
+[向量生成]   

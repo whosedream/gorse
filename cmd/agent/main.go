@@ -16,6 +16,7 @@ import (
 
 	"go-rec/internal/slow_track"
 	"go-rec/pkg/agent"
+	"go-rec/pkg/bloom"
 	"go-rec/pkg/cache"
 	"go-rec/pkg/mq"
 )
@@ -37,6 +38,8 @@ type DaemonDeps struct {
 	Embedder     agent.Embedder
 	Writer       cache.IntentWriter
 	LogPublisher agent.LogPublisher
+	Cooling      cache.CoolingChecker
+	ProfileCache *cache.ProfileCacheReader
 	BatchBuffer  int
 	Logger       interface{ Printf(string, ...any) }
 }
@@ -56,7 +59,12 @@ func (a slowTrackLLMAdapter) Complete(ctx context.Context, req LLMRequest) (stri
 	if err != nil {
 		return "", err
 	}
-	return resp.Text, nil
+	// Prefer the content field — DeepSeek v4-pro places the final JSON
+	// output there. Fall back to reasoning only when content is empty.
+	if resp.Text != "" {
+		return resp.Text, nil
+	}
+	return resp.Reasoning, nil
 }
 
 type graphLLMAdapter struct {
@@ -75,7 +83,7 @@ func BuildGraph(llm LLM, embedder agent.Embedder, writer cache.IntentWriter, pub
 	)
 }
 
-func RunBatch(ctx context.Context, batch mq.Batch, llm LLM, embedder agent.Embedder, writer cache.IntentWriter, publisher agent.LogPublisher) error {
+func RunBatch(ctx context.Context, batch mq.Batch, llm LLM, embedder agent.Embedder, writer cache.IntentWriter, publisher agent.LogPublisher, cooling cache.CoolingChecker, profileCache *cache.ProfileCacheReader) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -85,12 +93,48 @@ func RunBatch(ctx context.Context, batch mq.Batch, llm LLM, embedder agent.Embed
 	if sessionID == "" {
 		sessionID = batch.UserID
 	}
-	st := &agent.State{SessionID: sessionID, BaselineVersion: batch.BaselineVersion, Events: batch.Events}
+
+	// Check cooling window: if session is in cooling period, skip LLM and use cached profile.
+	if cooling != nil {
+		cooled, err := cooling.IsCooled(ctx, sessionID)
+		if err != nil {
+			log.Printf("[冷却窗口] 检查失败 session=%s err=%v", sessionID, err)
+		}
+		if !cooled {
+			log.Printf("[冷却窗口] session=%s 在冷却期内，跳过 LLM", sessionID)
+			// Try to use cached profile.
+			if profileCache != nil {
+				dst := make([]float32, cache.IntentVectorDim)
+				if ver, readErr := profileCache.ReadProfile(ctx, sessionID, dst); readErr == nil {
+					log.Printf("[冷却窗口] session=%s 使用缓存画像 version=%d", sessionID, ver)
+					return nil
+				}
+				log.Printf("[冷却窗口] session=%s 缓存未命中，仍跳过 LLM", sessionID)
+			}
+			return nil
+		}
+	}
+
+	log.Printf("[慢轨触发] session=%s events=%d baseline=%d", sessionID, len(batch.Events), batch.BaselineVersion)
+	st := &agent.State{SessionID: sessionID, BaselineVersion: batch.BaselineVersion, Events: batch.Events, Metadata: map[string]string{agent.MetadataReflectionActive: "true"}}
 	g, err := BuildGraph(llm, embedder, writer, publisher)
 	if err != nil {
+		log.Printf("[慢轨错误] BuildGraph 失败: %v", err)
 		return err
 	}
-	return g.Run(ctx, st)
+	runErr := g.Run(ctx, st)
+	if runErr != nil {
+		log.Printf("[慢轨错误] DAG 执行失败: %v", runErr)
+	} else {
+		log.Printf("[慢轨完成] session=%s", sessionID)
+		// Mark cooling window after successful LLM call.
+		if cooling != nil {
+			if markErr := cooling.MarkCalled(ctx, sessionID); markErr != nil {
+				log.Printf("[冷却窗口] 标记失败 session=%s err=%v", sessionID, markErr)
+			}
+		}
+	}
+	return runErr
 }
 
 func RunDaemon(ctx context.Context, deps DaemonDeps) error {
@@ -139,7 +183,7 @@ func RunDaemon(ctx context.Context, deps DaemonDeps) error {
 			wg.Add(1)
 			go func(b mq.Batch) {
 				defer wg.Done()
-				recordErr(RunBatch(workflowCtx, b, deps.LLM, deps.Embedder, deps.Writer, deps.LogPublisher))
+				recordErr(RunBatch(workflowCtx, b, deps.LLM, deps.Embedder, deps.Writer, deps.LogPublisher, deps.Cooling, deps.ProfileCache))
 			}(batch)
 		case <-ctx.Done():
 			_ = deps.Consumer.Close()
@@ -203,18 +247,76 @@ func main() {
 	if err != nil {
 		log.Fatalf("init redis writer: %v", err)
 	}
-	source, err := mq.NewKafkaEventSourceFromEnv()
-	if err != nil {
-		log.Fatalf("init kafka source: %v", err)
+
+	// Event source: Redis Pub/Sub by default. Kafka is wired and
+	// available — set USE_KAFKA=true with a running cluster to activate.
+	var batchConsumer batchConsumer
+
+	if os.Getenv("USE_KAFKA") != "true" {
+		log.Printf("using Redis Pub/Sub for behavior event consumption (channel: behavior:events)")
+		src := mq.NewRedisEventSource(redisClient, "behavior:events")
+		cons, consErr := mq.NewWindowConsumer(src, mq.Options{MaxBatch: 1, FlushInterval: 200 * time.Millisecond})
+		if consErr != nil {
+			log.Fatalf("init redis window consumer: %v", consErr)
+		}
+		batchConsumer = &closableWindowConsumer{consumer: cons, closer: src}
+	} else {
+		src, err := mq.NewKafkaEventSourceFromEnv()
+		if err != nil {
+			log.Fatalf("init kafka source: %v", err)
+		}
+		log.Printf("using Kafka as behavior event source")
+		cons, consErr := mq.NewWindowConsumer(src, mq.Options{MaxBatch: envInt("KAFKA_MAX_BATCH", 64), FlushInterval: time.Duration(envInt("KAFKA_FLUSH_MS", 200)) * time.Millisecond})
+		if consErr != nil {
+			log.Fatalf("init kafka window consumer: %v", consErr)
+		}
+		batchConsumer = &closableWindowConsumer{consumer: cons, closer: src}
 	}
-	consumer, err := mq.NewWindowConsumer(source, mq.Options{MaxBatch: envInt("KAFKA_MAX_BATCH", 64), FlushInterval: time.Duration(envInt("KAFKA_FLUSH_MS", 200)) * time.Millisecond})
-	if err != nil {
-		log.Fatalf("init window consumer: %v", err)
-	}
+
 	llmClient := slow_track.NewClientFromEnv()
 	embedder := agent.NewRemoteEmbedderFromEnv()
 	logPublisher := agent.NewRedisLogPublisher(redisClient)
-	deps := DaemonDeps{Consumer: &closableWindowConsumer{consumer: consumer, closer: source}, LLM: slowTrackLLMAdapter{client: llmClient}, Embedder: embedder, Writer: writer, LogPublisher: logPublisher, Logger: log.Default()}
+	if logPublisher == nil {
+		log.Printf("[警告] LogPublisher 为 nil!")
+	} else {
+		log.Printf("[初始化] LogPublisher 已就绪")
+	}
+
+	// Initialize cooling window and profile cache for LLM optimization.
+	coolingChecker, coolingErr := cache.NewRedisCoolingChecker(cache.RedisCoolingCheckerOptions{
+		Client: redisClient,
+		Window: 60 * time.Second,
+	})
+	if coolingErr != nil {
+		log.Printf("[警告] CoolingChecker 初始化失败: %v", coolingErr)
+	}
+
+	bloomFilter, bloomErr := bloom.NewRedisBloomFilter(bloom.Options{
+		Client: redisClient,
+		M:      1 << 20, // ~1M bits
+		K:      7,       // optimal for < 1% false positive
+		Key:    "bloom:profile:default",
+	})
+	if bloomErr != nil {
+		log.Printf("[警告] BloomFilter 初始化失败: %v", bloomErr)
+	}
+
+	profileCache := cache.NewProfileCacheReader(cache.ProfileCacheReaderOptions{
+		Client:    redisClient,
+		Bloom:     bloomFilter,
+		IntentDim: cache.IntentVectorDim,
+	})
+
+	deps := DaemonDeps{
+		Consumer:     batchConsumer,
+		LLM:          slowTrackLLMAdapter{client: llmClient},
+		Embedder:     embedder,
+		Writer:       writer,
+		LogPublisher: logPublisher,
+		Cooling:      coolingChecker,
+		ProfileCache: profileCache,
+		Logger:       log.Default(),
+	}
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)

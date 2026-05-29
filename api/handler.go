@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -11,12 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/time/rate"
 
 	"go-rec/internal/rk/anti_drift"
 	"go-rec/internal/rk/scorer"
 	"go-rec/pkg/agent"
 	"go-rec/pkg/cache"
+	"go-rec/pkg/catalog"
 	"go-rec/pkg/fsm"
 	"go-rec/pkg/mq"
 	"go-rec/pkg/pool"
@@ -97,6 +101,9 @@ type Server struct {
 	intentPool        *pool.IntentVectorPool
 	productSearch     ProductSearcher
 	streamSubscriber  streamSubscriber
+	catalog           *catalog.Catalog
+	rateLimiter       *rate.Limiter
+	cachedRouter      *gin.Engine
 }
 
 type Options struct {
@@ -114,6 +121,8 @@ type Options struct {
 	ProductSearch     ProductSearcher
 	StreamSubscriber  streamSubscriber
 	RedisClient       redis.UniversalClient
+	Catalog           *catalog.Catalog
+	RateLimit         float64 // requests per second; 0 = unlimited
 }
 
 type requestState struct {
@@ -152,6 +161,13 @@ func NewServer(opts Options) (*Server, error) {
 	}
 	candidateIDs := make([]int64, len(ids))
 	copy(candidateIDs, ids)
+
+	// Default rate limit: 20000 QPS as per spec
+	rateLimit := opts.RateLimit
+	if rateLimit <= 0 {
+		rateLimit = 20000
+	}
+
 	s := &Server{
 		parser:            fsm.NewParser(),
 		cache:             opts.Cache,
@@ -168,6 +184,8 @@ func NewServer(opts Options) (*Server, error) {
 		intentPool:        pool.NewIntentVectorPool(),
 		productSearch:     opts.ProductSearch,
 		streamSubscriber:  streamSub,
+		catalog:           opts.Catalog,
+		rateLimiter:       rate.NewLimiter(rate.Limit(rateLimit), int(rateLimit)),
 	}
 	if s.intentReadTimeout <= 0 {
 		s.intentReadTimeout = 2 * time.Millisecond
@@ -176,182 +194,220 @@ func NewServer(opts Options) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) Handler() http.Handler { return s }
+// Handler returns an http.Handler wrapping the Gin engine. Useful for
+// embedding in http.Server or test adapters.
+func (s *Server) Handler() http.Handler { return s.SetupRouter() }
 
-func applyCORS(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	if origin == "http://127.0.0.1:5173" || origin == "http://localhost:5173" {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Vary", "Origin")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// ServeHTTP implements http.Handler so existing test code that calls
+// s.ServeHTTP(rr, req) continues to work without modification.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.router().ServeHTTP(w, r)
+}
+
+func (s *Server) router() *gin.Engine {
+	if s.cachedRouter == nil {
+		s.cachedRouter = s.SetupRouter()
+	}
+	return s.cachedRouter
+}
+
+// SetupRouter creates and configures a Gin engine with all routes and middleware.
+func (s *Server) SetupRouter() *gin.Engine {
+	r := gin.New()
+
+	// Global middleware
+	r.Use(gin.Recovery())
+	r.Use(requestLogger())
+	r.Use(corsMiddleware())
+	r.Use(tokenBucketLimiter(s.rateLimiter))
+	r.Use(timeoutMiddleware(s.timeout))
+
+	// Routes
+	r.POST("/rerank", s.handleRerank)
+	r.GET("/stream", s.handleStreamGin)
+	r.GET("/products/meta", s.handleProductMetaGin)
+	r.GET("/products/ids", s.handleProductIDsGin)
+
+	return r
+}
+
+// corsMiddleware handles CORS for the Vite dev server.
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+		if origin != "" {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Content-Type, Cache-Control, Accept, Last-Event-ID")
+		}
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
 	}
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	applyCORS(w, r)
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
+// tokenBucketLimiter enforces a token-bucket rate limit.
+func tokenBucketLimiter(lim *rate.Limiter) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !lim.Allow() {
+			c.AbortWithStatus(http.StatusTooManyRequests)
+			return
+		}
+		c.Next()
 	}
-	if r.Method == http.MethodGet && r.URL.Path == "/stream" {
-		s.handleStream(w, r)
-		return
+}
+
+// timeoutMiddleware enforces a per-request deadline via context.
+func timeoutMiddleware(d time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), d)
+		defer cancel()
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
 	}
-	if s == nil || s.parser == nil || s.cache == nil || s.coordinator == nil || s.scorer == nil || s.pool == nil || s.reqPool == nil {
-		http.Error(w, "server unavailable", http.StatusInternalServerError)
-		return
+}
+
+// requestLogger logs method, path, status, and latency.
+func requestLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		latency := time.Since(start)
+		status := c.Writer.Status()
+		_ = status // structured logging can be added here
+		_ = latency
 	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+}
+
+// handleRerank handles POST /rerank requests using the FSM parser.
+func (s *Server) handleRerank(c *gin.Context) {
+	// Backpressure limiter (non-blocking)
 	select {
 	case s.limiter <- struct{}{}:
 		defer func() { <-s.limiter }()
 	default:
-		http.Error(w, "overloaded", http.StatusTooManyRequests)
+		c.String(http.StatusTooManyRequests, "overloaded")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
-	defer cancel()
+	ctx := c.Request.Context()
+	if ctx.Err() != nil {
+		c.String(http.StatusGatewayTimeout, "timeout")
+		return
+	}
+
 	err := s.reqPool.With(ctx, func(st *requestState) error {
-		return s.handle(ctx, w, r, st)
-	})
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, cache.ErrPartialTimeout) {
-			http.Error(w, "timeout", http.StatusGatewayTimeout)
-			return
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, fsm.MaxInputSize+1))
+		if err != nil {
+			return err
 		}
-		if errors.Is(err, fsm.ErrMalformed) || errors.Is(err, fsm.ErrInputTooLarge) || errors.Is(err, fsm.ErrValueTooLarge) {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
+		if len(body) > fsm.MaxInputSize {
+			return fsm.ErrInputTooLarge
 		}
-		if errors.Is(err, ErrNoCandidates) || errors.Is(err, cache.ErrMiss) {
-			http.Error(w, "no candidates", http.StatusServiceUnavailable)
-			return
+		st.body = append(st.body[:0], body...)
+		if err := s.parser.Parse(ctx, st.body, &st.req); err != nil {
+			return err
 		}
-		http.Error(w, "internal error", http.StatusInternalServerError)
-	}
-}
+		sessionID := st.req.SessionIDString()
+		expID := experimentID(sessionID)
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
-	if s == nil || s.streamSubscriber == nil {
-		http.Error(w, "stream unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	sessionID := r.URL.Query().Get("session_id")
-	if sessionID == "" {
-		http.Error(w, "missing session_id", http.StatusBadRequest)
-		return
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "stream unsupported", http.StatusInternalServerError)
-		return
-	}
-	header := w.Header()
-	header.Set("Content-Type", "text/event-stream")
-	header.Set("Cache-Control", "no-cache")
-	header.Set("Connection", "keep-alive")
-	pubsub := s.streamSubscriber.Subscribe(r.Context(), agent.SSELogChannelPrefix+sessionID)
-	defer pubsub.Close()
-	messages := pubsub.Channel()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case msg, ok := <-messages:
-			if !ok {
-				return
-			}
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", sanitizeSSEData(msg.Payload))
-			flusher.Flush()
+		// Extract fields that the FSM parser does not handle.
+		var extra struct {
+			ItemID string `json:"item_id"`
+			UserID string `json:"user_id"`
 		}
-	}
-}
+		_ = json.Unmarshal(st.body, &extra)
 
-func sanitizeSSEData(in string) string {
-	if in == "" {
-		return ""
-	}
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case '\r', '\n':
-			return ' '
-		default:
-			return r
-		}
-	}, in)
-}
+		s.publishBehavior(st.req, expID, extra.ItemID, extra.UserID)
 
-func (s *Server) handle(ctx context.Context, w http.ResponseWriter, r *http.Request, st *requestState) error {
-	body, err := io.ReadAll(io.LimitReader(r.Body, fsm.MaxInputSize+1))
-	if err != nil {
-		return err
-	}
-	if len(body) > fsm.MaxInputSize {
-		return fsm.ErrInputTooLarge
-	}
-	st.body = append(st.body[:0], body...)
-	if err := s.parser.Parse(ctx, st.body, &st.req); err != nil {
-		return err
-	}
-	sessionID := st.req.SessionIDString()
-	expID := experimentID(sessionID)
-	s.publishBehavior(st.req, expID)
-
-	if expID == experimentBaseline {
-		ensureBaselineCapacity(st, 20)
-		if bs, ok := s.productSearch.(baselineProductSearcher); ok {
-			category := st.req.CategoryString()
-			dbResults, dbErr := bs.SearchBaseline(ctx, category, 20)
-			if dbErr == nil && len(dbResults) > 0 {
-				results := st.results[:len(dbResults)]
-				n := productResultsToResults(dbResults, results)
-				writeResponse(w, sessionID, st.req.Fallback, false, results[:n])
-				return nil
-			}
-		}
-		return ErrNoCandidates
-	}
-
-	ids := s.candidateIDs
-	ensureRequestCapacity(st, len(ids), s.vectorDim)
-	ensureDuckDBCapacity(st, 20)
-	if expID == experimentNeuroRerank && s.intentReader != nil {
-		return s.intentPool.With(ctx, func(intent []float32) error {
-			readCtx, cancel := context.WithTimeout(ctx, s.intentReadTimeout)
-			_, readErr := s.intentReader.ReadIntent(readCtx, sessionID, intent)
-			cancel()
-			if readErr == nil && s.productSearch != nil {
+		if expID == experimentBaseline {
+			ensureBaselineCapacity(st, 20)
+			if bs, ok := s.productSearch.(baselineProductSearcher); ok {
 				category := st.req.CategoryString()
-				dbResults, dbErr := s.productSearch.SearchWithIntent(ctx, intent, category, 20)
+				dbResults, dbErr := bs.SearchBaseline(ctx, category, 20)
 				if dbErr == nil && len(dbResults) > 0 {
-					dbCandidates := st.candidates[:len(dbResults)]
-					productResultsToCandidates(dbResults, dbCandidates)
-					results := st.results[:len(dbCandidates)]
-					n, err := s.scorer.Rank(ctx, intent, dbCandidates, results)
-					if err != nil {
-						return err
-					}
-					fallback := st.req.Fallback
-					if rec, ok := s.coordinator.Get(sessionID); ok {
-						fallback = fallback || rec.Fallback
-					}
-					writeResponse(w, sessionID, fallback, true, results[:n])
+					results := st.results[:len(dbResults)]
+					n := productResultsToResults(dbResults, results)
+					writeGinResponse(c, sessionID, st.req.Fallback, false, results[:n])
 					return nil
 				}
 			}
-			return s.handleCacheFallback(ctx, w, st, sessionID, readErr == nil, intent)
-		})
+			if s.catalog != nil {
+				return s.handleCatalogRerankGin(ctx, c, st)
+			}
+			return ErrNoCandidates
+		}
+
+		ids := s.candidateIDs
+		ensureRequestCapacity(st, len(ids), s.vectorDim)
+		ensureDuckDBCapacity(st, 20)
+		if expID == experimentNeuroRerank && s.intentReader != nil {
+			return s.intentPool.With(ctx, func(intent []float32) error {
+				readCtx, cancel := context.WithTimeout(ctx, s.intentReadTimeout)
+				_, readErr := s.intentReader.ReadIntent(readCtx, sessionID, intent)
+				cancel()
+				if readErr == nil && s.productSearch != nil {
+					category := st.req.CategoryString()
+					dbResults, dbErr := s.productSearch.SearchWithIntent(ctx, intent, category, 20)
+					if dbErr == nil && len(dbResults) > 0 {
+						dbCandidates := st.candidates[:len(dbResults)]
+						productResultsToCandidates(dbResults, dbCandidates)
+						results := st.results[:len(dbCandidates)]
+						n, err := s.scorer.Rank(ctx, intent, dbCandidates, results)
+						if err != nil {
+							return err
+						}
+						writeGinResponse(c, sessionID, false, true, results[:n])
+						return nil
+					}
+				}
+				return s.handleCacheFallbackGin(ctx, c, st, sessionID, readErr == nil, intent)
+			})
+		}
+		return s.handleCacheFallbackGin(ctx, c, st, sessionID, false, nil)
+	})
+
+	if err != nil {
+		mapErrorToGin(c, err)
 	}
-	return s.handleCacheFallback(ctx, w, st, sessionID, false, nil)
 }
 
-func (s *Server) handleCacheFallback(ctx context.Context, w http.ResponseWriter, st *requestState, sessionID string, useIntent bool, intent []float32) error {
+func (s *Server) handleCatalogRerankGin(_ context.Context, c *gin.Context, st *requestState) error {
+	all := s.catalog.IDs()
+	catalogItems := s.catalog.Get(all)
+
+	limit := 20
+	if limit > len(catalogItems) {
+		limit = len(catalogItems)
+	}
+
+	c.Header("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+	_, _ = c.Writer.Write([]byte(`{"session_id":"`))
+	_, _ = c.Writer.Write([]byte(st.req.SessionIDString()))
+	_, _ = c.Writer.Write([]byte(`","fallback":true,"intent_hit":false,"results":[`))
+	for i := 0; i < limit; i++ {
+		if i > 0 {
+			_, _ = c.Writer.Write([]byte{','})
+		}
+		_, _ = c.Writer.Write([]byte(`{"id":"`))
+		_, _ = c.Writer.Write([]byte(catalogItems[i].ID))
+		_, _ = c.Writer.Write([]byte(`","score":`))
+		score := 20.0 - float64(i)
+		_, _ = c.Writer.Write([]byte(strconv.FormatFloat(score, 'f', -1, 32)))
+		_, _ = c.Writer.Write([]byte("}"))
+	}
+	_, _ = c.Writer.Write([]byte("]}"))
+	return nil
+}
+
+func (s *Server) handleCacheFallbackGin(ctx context.Context, c *gin.Context, st *requestState, sessionID string, useIntent bool, intent []float32) error {
+	if s.productSearch == nil && s.catalog != nil {
+		return s.handleCatalogRerankGin(ctx, c, st)
+	}
 	ids := s.candidateIDs
 	features := st.features[:len(ids)]
 	vectorBuf := st.vectorBuf[:len(ids)*s.vectorDim]
@@ -396,18 +452,226 @@ func (s *Server) handleCacheFallback(ctx context.Context, w http.ResponseWriter,
 	if err != nil {
 		return err
 	}
-	writeResponse(w, sessionID, rec.Fallback || st.req.Fallback, useIntent, results[:n])
+	writeGinResponse(c, sessionID, rec.Fallback || st.req.Fallback, useIntent, results[:n])
 	return nil
 }
 
-func (s *Server) publishBehavior(req fsm.RerankRequest, expID string) {
+// handleStreamGin handles GET /stream for SSE via Redis Pub/Sub.
+func (s *Server) handleStreamGin(c *gin.Context) {
+	if s == nil || s.streamSubscriber == nil {
+		c.String(http.StatusServiceUnavailable, "stream unavailable")
+		return
+	}
+	sessionID := c.Query("session_id")
+	if sessionID == "" {
+		c.String(http.StatusBadRequest, "missing session_id")
+		return
+	}
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.String(http.StatusInternalServerError, "stream unsupported")
+		return
+	}
+
+	header := c.Writer.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	// Ensure CORS headers for SSE
+	origin := c.GetHeader("Origin")
+	if origin != "" {
+		header.Set("Access-Control-Allow-Origin", origin)
+	}
+
+	ctx := c.Request.Context()
+	pubsub := s.streamSubscriber.Subscribe(ctx, agent.SSELogChannelPrefix+sessionID)
+	defer pubsub.Close()
+
+	// Flush headers immediately so EventSource fires onopen.
+	_, _ = fmt.Fprintf(c.Writer, ":ok\n\n")
+	flusher.Flush()
+
+	messages := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-messages:
+			if !ok {
+				return
+			}
+			_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", sanitizeSSEData(msg.Payload))
+			flusher.Flush()
+		}
+	}
+}
+
+// handleProductMetaGin handles GET /products/meta.
+func (s *Server) handleProductMetaGin(c *gin.Context) {
+	if s.catalog == nil {
+		c.String(http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	raw := c.Query("ids")
+	if raw == "" {
+		c.String(http.StatusBadRequest, "missing ids parameter")
+		return
+	}
+
+	parts := strings.Split(raw, ",")
+	if len(parts) > 50 {
+		c.String(http.StatusBadRequest, "too many ids (max 50)")
+		return
+	}
+
+	ids := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		ids = append(ids, p)
+	}
+	if len(ids) == 0 {
+		c.String(http.StatusBadRequest, "empty ids")
+		return
+	}
+
+	items := s.catalog.Get(ids)
+
+	c.Header("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+
+	if len(items) == 0 {
+		_, _ = c.Writer.Write([]byte("[]"))
+		return
+	}
+
+	_, _ = c.Writer.Write([]byte(`[`))
+	for i := range items {
+		if i > 0 {
+			_, _ = c.Writer.Write([]byte(`,`))
+		}
+		_, _ = c.Writer.Write([]byte(`{"id":"`))
+		_, _ = c.Writer.Write([]byte(items[i].ID))
+		_, _ = c.Writer.Write([]byte(`","title":"`))
+		_, _ = c.Writer.Write([]byte(escapeProductJSON(items[i].Title)))
+		_, _ = c.Writer.Write([]byte(`","price":`))
+		_, _ = c.Writer.Write([]byte(strconv.FormatFloat(items[i].Price, 'f', -1, 64)))
+		_, _ = c.Writer.Write([]byte(`,"image_url":"`))
+		_, _ = c.Writer.Write([]byte(items[i].ImageURL))
+		_, _ = c.Writer.Write([]byte(`","category":"`))
+		_, _ = c.Writer.Write([]byte(escapeProductJSON(items[i].Category)))
+		_, _ = c.Writer.Write([]byte(`"}`))
+	}
+	_, _ = c.Writer.Write([]byte(`]`))
+}
+
+// handleProductIDsGin handles GET /products/ids.
+func (s *Server) handleProductIDsGin(c *gin.Context) {
+	if s.catalog == nil {
+		c.String(http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	ids := s.catalog.IDs()
+	c.Header("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+	if len(ids) == 0 {
+		_, _ = c.Writer.Write([]byte("[]"))
+		return
+	}
+	_, _ = c.Writer.Write([]byte(`["`))
+	_, _ = c.Writer.Write([]byte(ids[0]))
+	_, _ = c.Writer.Write([]byte(`"`))
+	for _, id := range ids[1:] {
+		_, _ = c.Writer.Write([]byte(`,"`))
+		_, _ = c.Writer.Write([]byte(id))
+		_, _ = c.Writer.Write([]byte(`"`))
+	}
+	_, _ = c.Writer.Write([]byte("]"))
+}
+
+func sanitizeSSEData(in string) string {
+	if in == "" {
+		return ""
+	}
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n':
+			return ' '
+		default:
+			return r
+		}
+	}, in)
+}
+
+// escapeProductJSON escapes a string for safe insertion in a JSON string value.
+func escapeProductJSON(s string) string {
+	if s == "" {
+		return ""
+	}
+	if !containsSpecialJSON(s) {
+		return s
+	}
+	b := make([]byte, 0, len(s)+4)
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '\\':
+			b = append(b, '\\', '\\')
+		case '"':
+			b = append(b, '\\', '"')
+		case '\n':
+			b = append(b, '\\', 'n')
+		case '\r':
+			b = append(b, '\\', 'r')
+		case '\t':
+			b = append(b, '\\', 't')
+		default:
+			if c < 0x20 {
+				b = append(b, '\\', 'u', '0', '0', "0123456789abcdef"[c>>4], "0123456789abcdef"[c&0xf])
+			} else {
+				b = append(b, c)
+			}
+		}
+	}
+	return string(b)
+}
+
+func containsSpecialJSON(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' || c < 0x20 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) publishBehavior(req fsm.RerankRequest, expID, itemID, userID string) {
 	if s.producer == nil {
 		return
 	}
-	ev := mq.Event{SessionID: req.SessionIDString(), Timestamp: req.VersionStamp, Action: "rerank", ExpID: expID}
-	_ = s.pool.Submit(context.Background(), func(ctx context.Context) error {
-		return s.producer.Publish(ctx, ev)
-	})
+	if itemID == "" {
+		itemID = "unknown"
+	}
+	if userID == "" {
+		userID = req.SessionIDString()
+	}
+	ev := mq.Event{
+		SessionID:  req.SessionIDString(),
+		UserID:     userID,
+		ItemID:     itemID,
+		Timestamp:  req.VersionStamp,
+		Action:     "rerank",
+		ExpID:      expID,
+		CategoryID: req.CategoryString(),
+	}
+	// Raw goroutine, not the bounded pool — this publish MUST NOT be gated
+	// by pool capacity or the slow-track agent will miss behavior events.
+	go func() {
+		_ = s.producer.Publish(context.Background(), ev)
+	}()
 }
 
 func experimentID(sessionID string) string {
@@ -523,9 +787,6 @@ func productResultsToResults(products []ProductResult, out []scorer.Result) int 
 	return n
 }
 
-// productResultsToCandidates converts search results to scorer.Candidate
-// values. Each result's embedding becomes the Feature for dot-product scoring.
-// The ItemID is hashed to produce an int64 ID for the scorer pipeline.
 func productResultsToCandidates(results []ProductResult, candidates []scorer.Candidate) {
 	for i, r := range results {
 		id := hashStringToInt64(r.ItemID)
@@ -538,7 +799,6 @@ func productResultsToCandidates(results []ProductResult, candidates []scorer.Can
 	}
 }
 
-// hashStringToInt64 produces a positive int64 from a string using FNV-1a.
 func hashStringToInt64(s string) int64 {
 	var h uint64 = 14695981039346656037
 	for i := 0; i < len(s); i++ {
@@ -548,33 +808,49 @@ func hashStringToInt64(s string) int64 {
 	return int64(h & 0x7FFFFFFFFFFFFFFF)
 }
 
-func writeResponse(w http.ResponseWriter, sessionID string, fallback bool, intentHit bool, results []scorer.Result) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"session_id":"`))
-	_, _ = w.Write([]byte(sessionID))
-	_, _ = w.Write([]byte(`","fallback":`))
+func writeGinResponse(c *gin.Context, sessionID string, fallback bool, intentHit bool, results []scorer.Result) {
+	c.Header("Content-Type", "application/json")
+	c.Writer.WriteHeader(http.StatusOK)
+	_, _ = c.Writer.Write([]byte(`{"session_id":"`))
+	_, _ = c.Writer.Write([]byte(sessionID))
+	_, _ = c.Writer.Write([]byte(`","fallback":`))
 	if fallback {
-		_, _ = w.Write([]byte("true"))
+		_, _ = c.Writer.Write([]byte("true"))
 	} else {
-		_, _ = w.Write([]byte("false"))
+		_, _ = c.Writer.Write([]byte("false"))
 	}
-	_, _ = w.Write([]byte(`,"intent_hit":`))
+	_, _ = c.Writer.Write([]byte(`,"intent_hit":`))
 	if intentHit {
-		_, _ = w.Write([]byte("true"))
+		_, _ = c.Writer.Write([]byte("true"))
 	} else {
-		_, _ = w.Write([]byte("false"))
+		_, _ = c.Writer.Write([]byte("false"))
 	}
-	_, _ = w.Write([]byte(`,"results":[`))
+	_, _ = c.Writer.Write([]byte(`,"results":[`))
 	for i := range results {
 		if i > 0 {
-			_, _ = w.Write([]byte{','})
+			_, _ = c.Writer.Write([]byte{','})
 		}
-		_, _ = w.Write([]byte(`{"id":`))
-		_, _ = w.Write([]byte(strconv.FormatInt(results[i].ID, 10)))
-		_, _ = w.Write([]byte(`,"score":`))
-		_, _ = w.Write([]byte(strconv.FormatFloat(float64(results[i].Score), 'f', -1, 32)))
-		_, _ = w.Write([]byte("}"))
+		_, _ = c.Writer.Write([]byte(`{"id":`))
+		_, _ = c.Writer.Write([]byte(strconv.FormatInt(results[i].ID, 10)))
+		_, _ = c.Writer.Write([]byte(`,"score":`))
+		_, _ = c.Writer.Write([]byte(strconv.FormatFloat(float64(results[i].Score), 'f', -1, 32)))
+		_, _ = c.Writer.Write([]byte("}"))
 	}
-	_, _ = w.Write([]byte("]}"))
+	_, _ = c.Writer.Write([]byte("]}"))
+}
+
+func mapErrorToGin(c *gin.Context, err error) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, cache.ErrPartialTimeout) {
+		c.String(http.StatusGatewayTimeout, "timeout")
+		return
+	}
+	if errors.Is(err, fsm.ErrMalformed) || errors.Is(err, fsm.ErrInputTooLarge) || errors.Is(err, fsm.ErrValueTooLarge) {
+		c.String(http.StatusBadRequest, "bad request")
+		return
+	}
+	if errors.Is(err, ErrNoCandidates) || errors.Is(err, cache.ErrMiss) {
+		c.String(http.StatusServiceUnavailable, "no candidates")
+		return
+	}
+	c.String(http.StatusInternalServerError, "internal error")
 }

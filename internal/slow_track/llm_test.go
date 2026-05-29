@@ -1,4 +1,4 @@
-﻿package slow_track
+package slow_track
 
 import (
 	"context"
@@ -20,12 +20,12 @@ func TestDeepSeekEnvOptionsAndChatCompletionsRequest(t *testing.T) {
 		{
 			name: "env 读取 base url api key model 并补齐 chat completions endpoint",
 			run: func(t *testing.T) {
-				t.Setenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
+				t.Setenv("LLM_BASE_URL", "https://api.deepseek.com")
 				t.Setenv("LLM_API_KEY", "placeholder-key")
 				t.Setenv("LLM_MODEL", "deepseek-v4-pro")
 
 				opts := OptionsFromEnv()
-				if opts.Endpoint != "https://api.deepseek.com/v1/chat/completions" {
+				if opts.Endpoint != "https://api.deepseek.com/chat/completions" {
 					t.Fatalf("endpoint mismatch: %s", opts.Endpoint)
 				}
 				if opts.APIKey != "placeholder-key" {
@@ -59,7 +59,7 @@ func TestDeepSeekEnvOptionsAndChatCompletionsRequest(t *testing.T) {
 					}
 					seen <- struct{}{}
 					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write([]byte(`{"text":"ok"}`))
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
 				}))
 				defer srv.Close()
 
@@ -95,18 +95,18 @@ func TestDeepSeekClientCoTRetryBreakerAndHTTPStatus(t *testing.T) {
 		run  func(*testing.T)
 	}{
 		{
-			name: "请求体包含 CoT 字段且解析响应",
+			name: "请求体包含 thinking 字段且解析响应含 reasoning_content",
 			run: func(t *testing.T) {
-				var sawCoT atomic.Bool
+				var sawThinking atomic.Bool
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					buf := make([]byte, r.ContentLength)
 					_, _ = r.Body.Read(buf)
 					body := string(buf)
-					if strings.Contains(body, "enable_cot") && strings.Contains(body, "reasoning") && strings.Contains(body, "cache-key") {
-						sawCoT.Store(true)
+					if strings.Contains(body, `"thinking"`) && strings.Contains(body, `"enabled"`) {
+						sawThinking.Store(true)
 					}
 					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write([]byte(`{"text":"ok","reasoning":"cot","cached":true}`))
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok","reasoning_content":"cot"}}],"usage":{"prompt_tokens":10,"completion_tokens":20}}`))
 				}))
 				defer srv.Close()
 				c := NewClient(Options{Endpoint: srv.URL, APIKey: "k", MaxRetries: 1, BreakerThreshold: 3, BreakerOpenFor: time.Second})
@@ -114,8 +114,8 @@ func TestDeepSeekClientCoTRetryBreakerAndHTTPStatus(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Complete returned error: %v", err)
 				}
-				if !sawCoT.Load() || resp.Text != "ok" || resp.Reasoning != "cot" || !resp.Cached {
-					t.Fatalf("unexpected cot/response: saw=%v resp=%+v", sawCoT.Load(), resp)
+				if !sawThinking.Load() || resp.Text != "ok" || resp.Reasoning != "cot" {
+					t.Fatalf("unexpected: saw=%v resp=%+v", sawThinking.Load(), resp)
 				}
 			},
 		},
@@ -130,7 +130,7 @@ func TestDeepSeekClientCoTRetryBreakerAndHTTPStatus(t *testing.T) {
 						return
 					}
 					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write([]byte(`{"text":"ok-after-retry"}`))
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok-after-retry"}}],"usage":{}}`))
 				}))
 				defer srv.Close()
 				c := NewClient(Options{Endpoint: srv.URL, MaxRetries: 2, BreakerThreshold: 5, BreakerOpenFor: time.Second})

@@ -22,4 +22,12 @@ export interface RerankResponse {
   results: RerankResult[]
 }
 
+export interface MetaItem {
+  id: string
+  title: string
+  image_url: string
+  price: number
+  category: string
+}
+
 export type RerankMode = 'baseline' | 'ai-hit' | 'fallback'

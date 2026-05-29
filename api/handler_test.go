@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"go-rec/internal/rk/scorer"
 	"go-rec/pkg/agent"
 	"go-rec/pkg/cache"
+	"go-rec/pkg/catalog"
 	"go-rec/pkg/fsm"
 	"go-rec/pkg/mq"
 	"go-rec/pkg/pool"
@@ -170,6 +172,12 @@ func TestServerIntentReader(t *testing.T) {
 		}
 		if !strings.Contains(body, `"intent_hit":true`) {
 			t.Fatalf("reader intent path did not expose intent_hit=true: %s", body)
+		}
+		if !strings.Contains(body, `"fallback":false`) {
+			t.Fatalf("reader intent path fallback should be false: %s", body)
+		}
+		if strings.Contains(body, `"fallback":true`) {
+			t.Fatalf("reader intent path must not contain fallback:true: %s", body)
 		}
 	})
 
@@ -406,6 +414,15 @@ func TestServerABTrafficSplit(t *testing.T) {
 			}
 			if got := searcher.baselineCalls.Load(); got != tt.wantBaselineCalls {
 				t.Fatalf("baseline search calls=%d want=%d", got, tt.wantBaselineCalls)
+			}
+			body := rr.Body.String()
+			if tt.wantIntentCalls > 0 {
+				if !strings.Contains(body, `"intent_hit":true`) {
+					t.Fatalf("duckdb success path missing intent_hit=true: %s", body)
+				}
+				if !strings.Contains(body, `"fallback":false`) {
+					t.Fatalf("duckdb success path fallback should be false: %s", body)
+				}
 			}
 
 			select {
@@ -706,6 +723,50 @@ func TestServerProductSearchIntegration(t *testing.T) {
 			t.Fatalf("cache fallback did not put candidate 2 first: %s", body)
 		}
 	})
+
+}
+func TestServerDuckDBFallbackFlags(t *testing.T) {
+	t.Parallel()
+
+	reader := &stubIntentReader{version: 900, fill: func(dst []float32) {
+		for i := range dst {
+			dst[i] = 0.01
+		}
+	}}
+	searcher := &mockProductSearcher{
+		results: []ProductResult{
+			{ItemID: "db1", Category: "phone", Embedding: []float32{1, 0}},
+		},
+	}
+	s := newTestServer(t, Options{
+		CandidateIDs:      []int64{1, 2, 3},
+		VectorDim:         2,
+		MaxInFlight:       8,
+		Timeout:           50 * time.Millisecond,
+		IntentReader:      reader,
+		IntentReadTimeout: 2 * time.Millisecond,
+		ProductSearch:     searcher,
+	})
+	session := findSessionForExperiment(t, true)
+	seedFastRecord(t, s.coordinator, session, 1, []float32{1, 1})
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/rerank",
+		bytes.NewBufferString(validPayload(session, 1)))
+	s.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"fallback":false`) {
+		t.Fatalf("duckdb success must output fallback=false: %s", body)
+	}
+	if !strings.Contains(body, `"intent_hit":true`) {
+		t.Fatalf("duckdb success must output intent_hit=true: %s", body)
+	}
+	if strings.Contains(body, `"fallback":true`) {
+		t.Fatalf("duckdb success must NOT output fallback=true: %s", body)
+	}
 }
 
 func BenchmarkServerGoldenPath(b *testing.B) {
@@ -827,6 +888,182 @@ func (r *blockingResponseRecorder) waitBodyContains(t *testing.T, want string) {
 			t.Fatalf("body %q does not contain %q", body, want)
 		}
 	}
+}
+
+// TestServerCatalogMetaEndpoint exercises the GET /products/meta endpoint.
+func TestServerCatalogMetaEndpoint(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns 200 with 3 products for valid comma-separated ids", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{
+			CandidateIDs: []int64{1},
+			VectorDim:    2,
+			MaxInFlight:  4,
+			Timeout:      50 * time.Millisecond,
+			Catalog:      catalog.New("/_force_synthetic_"),
+		})
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/products/meta?ids=1,2,3", nil)
+		req.Header.Set("Origin", "http://127.0.0.1:5173")
+		s.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
+		}
+
+		var products []struct {
+			ID       string  `json:"id"`
+			Title    string  `json:"title"`
+			ImageURL string  `json:"image_url"`
+			Price    float64 `json:"price"`
+			Category string  `json:"category"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &products); err != nil {
+			t.Fatalf("json decode: %v body=%q", err, rr.Body.String())
+		}
+		if len(products) != 3 {
+			t.Fatalf("len = %d, want 3", len(products))
+		}
+		for i, p := range products {
+			if p.ID == "" {
+				t.Fatalf("product[%d].id is empty", i)
+			}
+			if p.Title == "" {
+				t.Fatalf("product[%d].title is empty", i)
+			}
+			if p.ImageURL == "" {
+				t.Fatalf("product[%d].image_url is empty", i)
+			}
+			if p.Price < 10 || p.Price > 2000 {
+				t.Fatalf("product[%d].price = %f, want in [10,2000]", i, p.Price)
+			}
+			if p.Category == "" {
+				t.Fatalf("product[%d].category is empty", i)
+			}
+		}
+
+		// CORS header must be present.
+		if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "http://127.0.0.1:5173" {
+			t.Fatalf("Access-Control-Allow-Origin = %q", got)
+		}
+		// Content-Type must be application/json.
+		if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+	})
+
+	t.Run("empty ids query returns 400", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{
+			CandidateIDs: []int64{1},
+			VectorDim:    2,
+			MaxInFlight:  4,
+			Timeout:      50 * time.Millisecond,
+			Catalog:      catalog.New("/_force_synthetic_"),
+		})
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/products/meta?ids=", nil)
+		s.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%q, want 400", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("non-existent id returns 200 with empty JSON array", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{
+			CandidateIDs: []int64{1},
+			VectorDim:    2,
+			MaxInFlight:  4,
+			Timeout:      50 * time.Millisecond,
+			Catalog:      catalog.New("/_force_synthetic_"),
+		})
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/products/meta?ids=99999", nil)
+		s.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
+		}
+		var products []json.RawMessage
+		if err := json.Unmarshal(rr.Body.Bytes(), &products); err != nil {
+			t.Fatalf("json decode: %v body=%q", err, rr.Body.String())
+		}
+		if len(products) != 0 {
+			t.Fatalf("len = %d, want 0", len(products))
+		}
+	})
+
+	t.Run("catalog nil returns 503", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{
+			CandidateIDs: []int64{1},
+			VectorDim:    2,
+			MaxInFlight:  4,
+			Timeout:      50 * time.Millisecond,
+			Catalog:      nil,
+		})
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/products/meta?ids=1", nil)
+		s.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d body=%q, want 503", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("exceeds 50 ids returns 400", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{
+			CandidateIDs: []int64{1},
+			VectorDim:    2,
+			MaxInFlight:  4,
+			Timeout:      50 * time.Millisecond,
+			Catalog:      catalog.New("/_force_synthetic_"),
+		})
+		var parts []string
+		for i := 1; i <= 51; i++ {
+			parts = append(parts, fmt.Sprintf("%d", i))
+		}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/products/meta?ids="+strings.Join(parts, ","), nil)
+		s.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d body=%q, want 400", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("max 50 ids works", func(t *testing.T) {
+		t.Parallel()
+		s := newTestServer(t, Options{
+			CandidateIDs: []int64{1},
+			VectorDim:    2,
+			MaxInFlight:  4,
+			Timeout:      50 * time.Millisecond,
+			Catalog:      catalog.New("/_force_synthetic_"),
+		})
+		var parts []string
+		for i := 1; i <= 50; i++ {
+			parts = append(parts, fmt.Sprintf("%d", i))
+		}
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/products/meta?ids="+strings.Join(parts, ","), nil)
+		s.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d body=%q, want 200", rr.Code, rr.Body.String())
+		}
+		var products []json.RawMessage
+		if err := json.Unmarshal(rr.Body.Bytes(), &products); err != nil {
+			t.Fatalf("json decode: %v body=%q", err, rr.Body.String())
+		}
+		if len(products) != 50 {
+			t.Fatalf("len = %d, want 50", len(products))
+		}
+	})
 }
 
 func newTestServer(t *testing.T, opts Options) *Server {

@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -187,3 +188,128 @@ func redisBulkBytes(v any) ([]byte, bool) {
 		return nil, false
 	}
 }
+
+// --- Profile Cache: bloom filter -> Redis -> LLM ---
+
+const (
+	profileCacheKeyPrefix = "profile:"
+	profileCacheTTL       = 5 * time.Minute
+)
+
+// BloomFilterer is the subset of bloom.Filter needed by ProfileCacheReader.
+type BloomFilterer interface {
+	Add(key string) bool
+	Contains(key string) bool
+}
+
+// ProfileCacheReader implements a three-tier read chain:
+// 1. Bloom filter check (fast rejection)
+// 2. Redis cached intent vector
+// 3. Fallback to caller (LLM inference)
+type ProfileCacheReader struct {
+	client    redis.UniversalClient
+	bloom     BloomFilterer
+	intentDim int
+}
+
+type ProfileCacheReaderOptions struct {
+	Client    redis.UniversalClient
+	Bloom     BloomFilterer
+	IntentDim int
+}
+
+func NewProfileCacheReader(opts ProfileCacheReaderOptions) *ProfileCacheReader {
+	dim := opts.IntentDim
+	if dim <= 0 {
+		dim = IntentVectorDim
+	}
+	return &ProfileCacheReader{
+		client:    opts.Client,
+		bloom:     opts.Bloom,
+		intentDim: dim,
+	}
+}
+
+// ReadProfile attempts to read a cached profile for sessionID.
+// Returns (vector, version, nil) on cache hit, or (nil, 0, ErrMiss) on miss.
+func (r *ProfileCacheReader) ReadProfile(ctx context.Context, sessionID string, dst []float32) (version int64, err error) {
+	if r == nil || sessionID == "" || len(dst) < r.intentDim {
+		return 0, ErrInvalidIntent
+	}
+	// Tier 1: Bloom filter fast rejection.
+	if r.bloom != nil && !r.bloom.Contains(sessionID) {
+		return 0, ErrMiss
+	}
+	// Tier 2: Redis cached profile.
+	if r.client == nil {
+		return 0, ErrMiss
+	}
+	vals, err := r.client.HMGet(ctx, profileCacheKey(sessionID), "version", "vector").Result()
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		return 0, ErrMiss
+	}
+	if len(vals) != 2 || vals[0] == nil || vals[1] == nil {
+		return 0, ErrMiss
+	}
+	v, ok := parseRedisInt64(vals[0])
+	if !ok || v <= 0 {
+		return 0, ErrCorruptIntent
+	}
+	raw, ok := redisBulkBytes(vals[1])
+	if !ok {
+		return 0, ErrCorruptIntent
+	}
+	if err := UnmarshalIntentVector(raw, dst); err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+// CacheProfile writes a profile to Redis and adds session to bloom filter.
+func (r *ProfileCacheReader) CacheProfile(ctx context.Context, sessionID string, vector []float32, version int64) error {
+	if r == nil || sessionID == "" || len(vector) < r.intentDim || version <= 0 {
+		return ErrInvalidIntent
+	}
+	// Write to Redis.
+	if r.client != nil {
+		raw, err := marshalIntentVector(vector[:r.intentDim])
+		if err != nil {
+			return err
+		}
+		pipe := r.client.Pipeline()
+		pipe.HSet(ctx, profileCacheKey(sessionID), "version", version, "vector", raw)
+		pipe.Expire(ctx, profileCacheKey(sessionID), profileCacheTTL)
+		if _, err := pipe.Exec(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+	}
+	// Add to bloom filter.
+	if r.bloom != nil {
+		r.bloom.Add(sessionID)
+	}
+	return nil
+}
+
+func profileCacheKey(sessionID string) string {
+	return profileCacheKeyPrefix + sessionID
+}
+
+// marshalIntentVector serializes a float32 slice to bytes using binary encoding.
+func marshalIntentVector(vector []float32) ([]byte, error) {
+	buf := make([]byte, len(vector)*4)
+	for i, v := range vector {
+		bits := math.Float32bits(v)
+		buf[i*4] = byte(bits)
+		buf[i*4+1] = byte(bits >> 8)
+		buf[i*4+2] = byte(bits >> 16)
+		buf[i*4+3] = byte(bits >> 24)
+	}
+	return buf, nil
+}
+

@@ -13,3 +13,4 @@ frontend/dist/
 # Local automation/runtime artifacts
 .playwright-mcp/
 .omc/state/
+data/*.csv

@@ -230,7 +230,16 @@ func NewKafkaEventSourceFromEnv() (*KafkaEventSource, error) {
 	if groupID == "" {
 		groupID = "rk_slow_track"
 	}
-	return &KafkaEventSource{reader: kafka.NewReader(kafka.ReaderConfig{Brokers: brokers, Topic: topic, GroupID: groupID})}, nil
+	// Kafka broker manages partition assignment for the consumer group.
+	// With 8 partitions, up to 8 consumers in this group can process in parallel.
+	// MinBytes/MaxBytes control the fetch batch size per poll to reduce broker round-trips.
+	return &KafkaEventSource{reader: kafka.NewReader(kafka.ReaderConfig{
+		Brokers:  brokers,
+		Topic:    topic,
+		GroupID:  groupID,
+		MinBytes: 1,        // fetch at least 1 byte
+		MaxBytes: 10e6,     // fetch at most 10 MB per poll
+	})}, nil
 }
 
 func (s *KafkaEventSource) Fetch(ctx context.Context) (Message, error) {

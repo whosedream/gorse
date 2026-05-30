@@ -30,7 +30,7 @@ func DefaultEvaluatorConfig() EvaluatorConfig {
 	return EvaluatorConfig{
 		Folds:      5,
 		TopK:       10,
-		MinUser:    20,
+		MinUser:    5,
 		CandidateN: 99,
 	}
 }
@@ -147,8 +147,8 @@ func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metr
 	for fold := 0; fold < folds; fold++ {
 		fmt.Printf("[eval] === Fold %d/%d ===\n", fold+1, folds)
 
-		// --- Baseline: pure CF (BPR personalized ranking, no Content/Profile signals) ---
-		baseMetrics := e.evaluatePureCF(testCases, data.ItemIDs, recaller, rng)
+		// --- Baseline: popularity ranking ---
+		baseMetrics := e.evaluatePopularity(testCases, data.ItemIDs, itemPop, rng)
 
 		// --- Enhanced: three-way recall (CF + Content + Profile) ---
 		enhMetrics := e.evaluateThreeWay(testCases, data.ItemIDs, recaller, itemCooccur, trainUserItems, itemPop, len(fullTrain), rng)
@@ -175,13 +175,13 @@ func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metr
 	return results, avgBaseline, avgEnhanced, tTest, nil
 }
 
-// evaluatePureCF evaluates pure collaborative filtering baseline using only BPR scores.
-// No Content or Profile signals are used — this isolates the CF signal.
-func (e *Evaluator) evaluatePureCF(testCases []struct {
+// evaluatePopularity evaluates popularity-based ranking baseline.
+// Items are ranked by how many users interacted with them in training data.
+func (e *Evaluator) evaluatePopularity(testCases []struct {
 	user     string
 	posItem  string
 	trainSet map[string]struct{}
-}, allItems []string, recaller *cf.CFRecaller, rng *rand.Rand) Metrics {
+}, allItems []string, itemPop map[string]int, rng *rand.Rand) Metrics {
 
 	negN := e.cfg.CandidateN
 	ndcgSum, hrSum := 0.0, 0.0
@@ -191,18 +191,16 @@ func (e *Evaluator) evaluatePureCF(testCases []struct {
 		negItems := sampleNeg(allItems, tc.trainSet, tc.posItem, negN, rng)
 		candidates := append([]string{tc.posItem}, negItems...)
 
-		// Score each candidate using only BPR personalized score (pure CF)
-		type scored struct {
-			item  string
-			score float64
+		// Rank by popularity
+		type kv struct {
+			item string
+			pop  int
 		}
-		pairs := make([]scored, len(candidates))
+		pairs := make([]kv, len(candidates))
 		for i, item := range candidates {
-			pairs[i] = scored{item: item, score: float64(recaller.Predict(tc.user, item))}
+			pairs[i] = kv{item: item, pop: itemPop[item]}
 		}
-
-		// Sort by BPR score descending
-		sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].pop > pairs[j].pop })
 		ranked := make([]string, len(pairs))
 		for i, p := range pairs {
 			ranked[i] = p.item

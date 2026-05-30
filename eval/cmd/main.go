@@ -11,10 +11,10 @@ import (
 )
 
 func main() {
-	csvPath := flag.String("csv", "data/ratings_Electronics.csv", "path to Amazon Reviews CSV")
+	csvPath := flag.String("csv", "", "path to Amazon Reviews CSV")
 	folds := flag.Int("folds", 5, "number of random folds")
 	topK := flag.Int("topk", 20, "recall top-K")
-	minUser := flag.Int("min-user", 20, "minimum interactions per user")
+	minUser := flag.Int("min-user", 5, "minimum interactions per user")
 	maxSamples := flag.Int("max-samples", 0, "max records to load (0 = all)")
 	flag.Parse()
 

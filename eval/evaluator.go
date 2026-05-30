@@ -114,17 +114,44 @@ func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metr
 		folds = 5
 	}
 
+	// Build item popularity from training data
+	itemPop := make(map[string]int)
+	for _, it := range fullTrain {
+		itemPop[it.ItemID]++
+	}
+
+	// Build item co-occurrence for content recall
+	itemCooccur := make(map[string]map[string]int)
+	trainUserItems := make(map[string][]string)
+	for _, it := range fullTrain {
+		trainUserItems[it.UserID] = append(trainUserItems[it.UserID], it.ItemID)
+	}
+	for _, items := range trainUserItems {
+		for i, a := range items {
+			for _, b := range items[i+1:] {
+				if itemCooccur[a] == nil {
+					itemCooccur[a] = make(map[string]int)
+				}
+				if itemCooccur[b] == nil {
+					itemCooccur[b] = make(map[string]int)
+				}
+				itemCooccur[a][b]++
+				itemCooccur[b][a]++
+			}
+		}
+	}
+
 	rng := rand.New(rand.NewSource(42))
 	results := make([]EvalResult, 0, folds)
 
 	for fold := 0; fold < folds; fold++ {
 		fmt.Printf("[eval] === Fold %d/%d ===\n", fold+1, folds)
 
-		// --- Baseline: random ranking ---
-		baseMetrics := e.evaluateRandom(testCases, data.ItemIDs, rng)
+		// --- Baseline: popularity ranking ---
+		baseMetrics := e.evaluatePopularity(testCases, data.ItemIDs, itemPop, rng)
 
-		// --- Enhanced: BPR personalized ranking ---
-		enhMetrics := e.evaluateBPR(testCases, data.ItemIDs, recaller, rng)
+		// --- Enhanced: three-way recall (CF + Content + Profile) ---
+		enhMetrics := e.evaluateThreeWay(testCases, data.ItemIDs, recaller, itemCooccur, trainUserItems, itemPop, len(fullTrain), rng)
 
 		result := EvalResult{Fold: fold + 1, Baseline: baseMetrics, Enhanced: enhMetrics}
 		results = append(results, result)
@@ -148,13 +175,13 @@ func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metr
 	return results, avgBaseline, avgEnhanced, tTest, nil
 }
 
-// evaluateRandom evaluates random ranking baseline.
-// Expected HR@10 = 10/100 = 0.10, NDCG@10 depends on position.
-func (e *Evaluator) evaluateRandom(testCases []struct {
+// evaluatePopularity evaluates popularity-based ranking baseline.
+// Items are ranked by how many users interacted with them in training data.
+func (e *Evaluator) evaluatePopularity(testCases []struct {
 	user     string
 	posItem  string
 	trainSet map[string]struct{}
-}, allItems []string, rng *rand.Rand) Metrics {
+}, allItems []string, itemPop map[string]int, rng *rand.Rand) Metrics {
 
 	negN := e.cfg.CandidateN
 	ndcgSum, hrSum := 0.0, 0.0
@@ -164,14 +191,24 @@ func (e *Evaluator) evaluateRandom(testCases []struct {
 		negItems := sampleNeg(allItems, tc.trainSet, tc.posItem, negN, rng)
 		candidates := append([]string{tc.posItem}, negItems...)
 
-		// Random shuffle
-		rng.Shuffle(len(candidates), func(i, j int) {
-			candidates[i], candidates[j] = candidates[j], candidates[i]
-		})
+		// Rank by popularity
+		type kv struct {
+			item string
+			pop  int
+		}
+		pairs := make([]kv, len(candidates))
+		for i, item := range candidates {
+			pairs[i] = kv{item: item, pop: itemPop[item]}
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].pop > pairs[j].pop })
+		ranked := make([]string, len(pairs))
+		for i, p := range pairs {
+			ranked[i] = p.item
+		}
 
 		relSet := map[string]struct{}{tc.posItem: {}}
-		ndcgSum += NDCG(relSet, candidates, e.cfg.TopK)
-		hrSum += HR(relSet, candidates, e.cfg.TopK)
+		ndcgSum += NDCG(relSet, ranked, e.cfg.TopK)
+		hrSum += HR(relSet, ranked, e.cfg.TopK)
 		count++
 	}
 
@@ -182,12 +219,15 @@ func (e *Evaluator) evaluateRandom(testCases []struct {
 	return Metrics{NDCG10: ndcgSum / n, HR20: hrSum / n}
 }
 
-// evaluateBPR evaluates BPR personalized ranking.
-func (e *Evaluator) evaluateBPR(testCases []struct {
+// evaluateThreeWay evaluates three-way recall: CF + Content + Profile.
+// CF: BPR predicted score (personalized collaborative filtering)
+// Content: item co-occurrence similarity (items frequently bought together)
+// Profile: user similarity (items popular among similar users)
+func (e *Evaluator) evaluateThreeWay(testCases []struct {
 	user     string
 	posItem  string
 	trainSet map[string]struct{}
-}, allItems []string, recaller *cf.CFRecaller, rng *rand.Rand) Metrics {
+}, allItems []string, recaller *cf.CFRecaller, itemCooccur map[string]map[string]int, userItems map[string][]string, itemPop map[string]int, totalInteractions int, rng *rand.Rand) Metrics {
 
 	negN := e.cfg.CandidateN
 	ndcgSum, hrSum := 0.0, 0.0
@@ -197,17 +237,52 @@ func (e *Evaluator) evaluateBPR(testCases []struct {
 		negItems := sampleNeg(allItems, tc.trainSet, tc.posItem, negN, rng)
 		candidates := append([]string{tc.posItem}, negItems...)
 
-		// Score each candidate with BPR
+		// Score each candidate with three-way recall
 		type scored struct {
 			item  string
-			score float32
+			score float64
 		}
 		pairs := make([]scored, len(candidates))
 		for i, item := range candidates {
-			pairs[i] = scored{item: item, score: recaller.Predict(tc.user, item)}
+			var score float64
+
+			// Path 1: CF (BPR personalized score)
+			cfScore := float64(recaller.Predict(tc.user, item))
+			score += 0.4 * cfScore
+
+			// Path 2: Content (co-occurrence with user's training items)
+			contentScore := 0.0
+			for trainItem := range tc.trainSet {
+				if coItems, ok := itemCooccur[trainItem]; ok {
+					if c, ok := coItems[item]; ok {
+						s := float64(c) / float64(len(coItems))
+						if s > contentScore {
+							contentScore = s
+						}
+					}
+				}
+			}
+			score += 0.3 * contentScore
+
+			// Path 3: Profile (items popular among similar users)
+			profileScore := 0.0
+			similarCount := 0
+			for trainItem := range tc.trainSet {
+				for _, simUser := range userItems[trainItem] {
+					if simUser != tc.user {
+						similarCount++
+					}
+				}
+			}
+			if similarCount > 0 {
+				profileScore = float64(len(tc.trainSet)) / float64(similarCount+1)
+			}
+			score += 0.3 * profileScore * float64(itemPop[item]) / float64(totalInteractions+1)
+
+			pairs[i] = scored{item: item, score: score}
 		}
 
-		// Sort by BPR score descending
+		// Sort by combined score descending
 		sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
 		ranked := make([]string, len(pairs))
 		for i, p := range pairs {

@@ -12,32 +12,41 @@ import (
 // TestThreeWayRecallSynthetic validates the three-way recall system on a synthetic dataset
 // where we know the ground truth. This demonstrates the system works correctly.
 func TestThreeWayRecallSynthetic(t *testing.T) {
-	// Create synthetic data: 100 users, 50 items, ~500 interactions
-	// Users are grouped into 5 clusters, each cluster prefers certain items
+	// Create synthetic data: 500 users, 200 items, ~3000 interactions
+	// Users have soft preferences (not hard clusters) — more realistic
 	rng := rand.New(rand.NewSource(42))
-	nUsers := 100
-	nItems := 50
-	nClusters := 5
+	nUsers := 500
+	nItems := 200
+	nGroups := 10
 
-	// Assign users to clusters
-	userCluster := make([]int, nUsers)
-	for i := range userCluster {
-		userCluster[i] = i % nClusters
+	// Assign users to preference groups (soft — each user has primary + secondary preferences)
+	userPrimary := make([]int, nUsers)
+	userSecondary := make([]int, nUsers)
+	for i := range userPrimary {
+		userPrimary[i] = i % nGroups
+		userSecondary[i] = (i/nGroups + 1) % nGroups // secondary preference overlaps with others
 	}
 
-	// Each cluster has preferred items (items 0-9 for cluster 0, 10-19 for cluster 1, etc.)
+	// Each group has preferred items (overlapping ranges — more realistic)
 	var interactions []cf.Interaction
 	for u := 0; u < nUsers; u++ {
-		cluster := userCluster[u]
-		// Each user interacts with 5-10 items from their cluster + 1-2 random items
-		nInteract := 5 + rng.Intn(6)
+		pri := userPrimary[u]
+		sec := userSecondary[u]
+		// Each user interacts with 8-15 items
+		nInteract := 8 + rng.Intn(8)
 		seen := make(map[string]struct{})
 		for i := 0; i < nInteract; i++ {
 			var itemID string
-			if rng.Float64() < 0.8 { // 80% from preferred cluster
-				itemID = fmt.Sprintf("item_%02d", cluster*10+rng.Intn(10))
-			} else { // 20% random
-				itemID = fmt.Sprintf("item_%02d", rng.Intn(nItems))
+			r := rng.Float64()
+			switch {
+			case r < 0.5: // 50% from primary group
+				base := pri * 20
+				itemID = fmt.Sprintf("item_%03d", base+rng.Intn(20))
+			case r < 0.75: // 25% from secondary group
+				base := sec * 20
+				itemID = fmt.Sprintf("item_%03d", base+rng.Intn(20))
+			default: // 25% random
+				itemID = fmt.Sprintf("item_%03d", rng.Intn(nItems))
 			}
 			if _, ok := seen[itemID]; !ok {
 				seen[itemID] = struct{}{}
@@ -169,8 +178,8 @@ func TestThreeWayRecallSynthetic(t *testing.T) {
 
 	t.Logf("Baseline: NDCG@10=%.4f HR@10=%.4f", baseAvgNDCG, baseAvgHR)
 	t.Logf("Enhanced: NDCG@10=%.4f HR@10=%.4f", enhAvgNDCG, enhAvgHR)
-	t.Logf("NDCG improvement: %.2f%%", (enhAvgNDCG-baseAvgNDCG)/baseAvgNDCG*100)
-	t.Logf("HR improvement: %.2f%%", (enhAvgHR-baseAvgHR)/baseAvgHR*100)
+	t.Logf("NDCG improvement: %.2f%% (target: >=10%%)", (enhAvgNDCG-baseAvgNDCG)/baseAvgNDCG*100)
+	t.Logf("HR improvement: %.2f%% (target: >=10%%)", (enhAvgHR-baseAvgHR)/baseAvgHR*100)
 
 	ctx := context.Background()
 	_ = ctx

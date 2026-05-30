@@ -49,8 +49,13 @@ func LoadCSV(path string, maxSamples int) (*LoadResult, error) {
 			}
 		}
 
-		fields := strings.SplitN(line, ",", 4)
-		if len(fields) < 3 {
+		// Auto-detect delimiter: tab for MovieLens, comma for Amazon
+		sep := ","
+		if strings.Contains(line, "\t") {
+			sep = "\t"
+		}
+		fields := strings.SplitN(line, sep, 4)
+		if len(fields) < 2 {
 			continue
 		}
 		userID := strings.TrimSpace(fields[0])

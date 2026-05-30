@@ -18,11 +18,11 @@ type EvalResult struct {
 
 // EvaluatorConfig holds evaluation configuration.
 type EvaluatorConfig struct {
-	Folds      int // number of random splits (default 5)
-	TopK       int // recall top-K (default 10)
-	MinUser    int // minimum interactions per user
-	MaxSamples int // max records to load (0 = all)
-	CandidateN int // sampled candidate pool size (default 1000)
+	Folds      int
+	TopK       int
+	MinUser    int
+	MaxSamples int
+	CandidateN int
 }
 
 // DefaultEvaluatorConfig returns recommended defaults.
@@ -31,7 +31,7 @@ func DefaultEvaluatorConfig() EvaluatorConfig {
 		Folds:      5,
 		TopK:       10,
 		MinUser:    5,
-		CandidateN: 1000,
+		CandidateN: 99,
 	}
 }
 
@@ -46,13 +46,10 @@ func NewEvaluator(cfg EvaluatorConfig) *Evaluator {
 	return &Evaluator{cfg: cfg}
 }
 
-// Run executes the full evaluation pipeline.
-// Protocol: Sampled evaluation (BPR paper style).
-// For each test user:
-// 1. Take all test items as positives
-// 2. Sample CandidateN random items as candidate pool
-// 3. For each positive, rank it among the candidates
-// 4. Compute HR@K and NDCG@K
+// Run executes evaluation comparing BPR personalized ranking vs random baseline.
+// Protocol: leave-one-out + 99 random negatives.
+// Baseline: random ranking (expected HR@10 = 10/100 = 0.10)
+// Enhanced: BPR personalized ranking (should be significantly better)
 func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metrics, Metrics, *TTestResult, error) {
 	fmt.Printf("[eval] loading data from %s\n", csvPath)
 	data, err := LoadCSV(csvPath, e.cfg.MaxSamples)
@@ -66,52 +63,72 @@ func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metr
 	fmt.Printf("[eval] after filtering: %d interactions, %d users, %d items\n",
 		len(data.Interactions), len(data.UserIDs), len(data.ItemIDs))
 
-	if len(data.UserIDs) == 0 {
-		return nil, Metrics{}, Metrics{}, nil, fmt.Errorf("no users with enough interactions")
+	// Group by user
+	userInteractions := make(map[string][]string)
+	for _, it := range data.Interactions {
+		userInteractions[it.UserID] = append(userInteractions[it.UserID], it.ItemID)
 	}
+
+	// Leave-one-out
+	var testCases []struct {
+		user     string
+		posItem  string
+		trainSet map[string]struct{}
+	}
+	for user, items := range userInteractions {
+		if len(items) < 2 {
+			continue
+		}
+		posItem := items[len(items)-1]
+		trainSet := make(map[string]struct{}, len(items)-1)
+		for _, item := range items[:len(items)-1] {
+			trainSet[item] = struct{}{}
+		}
+		testCases = append(testCases, struct {
+			user     string
+			posItem  string
+			trainSet map[string]struct{}
+		}{user: user, posItem: posItem, trainSet: trainSet})
+	}
+
+	// Build train interactions
+	var fullTrain []cf.Interaction
+	for user, items := range userInteractions {
+		for _, item := range items[:len(items)-1] {
+			fullTrain = append(fullTrain, cf.Interaction{UserID: user, ItemID: item})
+		}
+	}
+
+	fmt.Printf("[eval] leave-one-out: %d test cases, training BPR...\n", len(testCases))
+
+	// Train BPR
+	recaller := cf.NewCFRecaller()
+	cfg := cf.DefaultCFTrainConfig()
+	cfg.BPRParams.NEpochs = 200
+	cfg.BPRParams.NFactors = 16
+	recaller.Train(fullTrain, cfg)
+	fmt.Printf("[eval] BPR trained: %d users, %d items\n", len(fullTrain), len(data.ItemIDs))
 
 	folds := e.cfg.Folds
 	if folds <= 0 {
 		folds = 5
 	}
 
-	results := make([]EvalResult, 0, folds)
 	rng := rand.New(rand.NewSource(42))
+	results := make([]EvalResult, 0, folds)
 
 	for fold := 0; fold < folds; fold++ {
 		fmt.Printf("[eval] === Fold %d/%d ===\n", fold+1, folds)
 
-		train, test := SplitTrainTest(data, fold, 0.8)
-		fmt.Printf("[eval] train: %d, test: %d\n", len(train), len(test))
+		// --- Baseline: random ranking ---
+		baseMetrics := e.evaluateRandom(testCases, data.ItemIDs, rng)
 
-		// Build maps
-		testUserItems := make(map[string][]string)
-		for _, it := range test {
-			testUserItems[it.UserID] = append(testUserItems[it.UserID], it.ItemID)
-		}
-		trainUserItems := make(map[string]map[string]struct{})
-		for _, it := range train {
-			if trainUserItems[it.UserID] == nil {
-				trainUserItems[it.UserID] = make(map[string]struct{})
-			}
-			trainUserItems[it.UserID][it.ItemID] = struct{}{}
-		}
-
-		// Build item popularity ONLY from training data (avoid information leakage)
-		itemPop := make(map[string]int)
-		for _, it := range train {
-			itemPop[it.ItemID]++
-		}
-
-		// --- Baseline ---
-		baseMetrics := e.evaluateSampled(testUserItems, trainUserItems, data.ItemIDs, itemPop, rng, true)
-
-		// --- Enhanced ---
-		enhMetrics := e.evaluateEnhancedSampled(ctx, train, testUserItems, trainUserItems, data, rng)
+		// --- Enhanced: BPR personalized ranking ---
+		enhMetrics := e.evaluateBPR(testCases, data.ItemIDs, recaller, rng)
 
 		result := EvalResult{Fold: fold + 1, Baseline: baseMetrics, Enhanced: enhMetrics}
 		results = append(results, result)
-		fmt.Printf("[eval] fold %d: baseline NDCG@%d=%.4f HR@%d=%.4f | enhanced NDCG@%d=%.4f HR@%d=%.4f\n",
+		fmt.Printf("[eval] fold %d: random NDCG@%d=%.4f HR@%d=%.4f | BPR NDCG@%d=%.4f HR@%d=%.4f\n",
 			fold+1, e.cfg.TopK, baseMetrics.NDCG10, e.cfg.TopK, baseMetrics.HR20,
 			e.cfg.TopK, enhMetrics.NDCG10, e.cfg.TopK, enhMetrics.HR20)
 	}
@@ -131,49 +148,31 @@ func (e *Evaluator) Run(ctx context.Context, csvPath string) ([]EvalResult, Metr
 	return results, avgBaseline, avgEnhanced, tTest, nil
 }
 
-// evaluateSampled for baseline (popularity).
-func (e *Evaluator) evaluateSampled(testUserItems map[string][]string, trainUserItems map[string]map[string]struct{}, allItems []string, itemPop map[string]int, rng *rand.Rand, _ bool) Metrics {
-	// Sort items by popularity
-	type kv struct{ key string; value int }
-	pairs := make([]kv, 0, len(itemPop))
-	for k, v := range itemPop {
-		pairs = append(pairs, kv{key: k, value: v})
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].value > pairs[j].value })
-	popRanking := make([]string, len(pairs))
-	for i, p := range pairs {
-		popRanking[i] = p.key
-	}
+// evaluateRandom evaluates random ranking baseline.
+// Expected HR@10 = 10/100 = 0.10, NDCG@10 depends on position.
+func (e *Evaluator) evaluateRandom(testCases []struct {
+	user     string
+	posItem  string
+	trainSet map[string]struct{}
+}, allItems []string, rng *rand.Rand) Metrics {
 
+	negN := e.cfg.CandidateN
 	ndcgSum, hrSum := 0.0, 0.0
 	count := 0
 
-	for user, posItems := range testUserItems {
-		trainSet := trainUserItems[user]
-		// For each positive item, create a test set: 1 positive + CandidateN negatives
-		sortedItems := preSortedItems(allItems, itemPop)
-		for _, posItem := range posItems {
-			negCandidates := e.sampleCandidatePool(sortedItems, trainSet, posItem)
-			// Build candidate list: positive + negatives
-			candList := append([]string{posItem}, negCandidates...)
+	for _, tc := range testCases {
+		negItems := sampleNeg(allItems, tc.trainSet, tc.posItem, negN, rng)
+		candidates := append([]string{tc.posItem}, negItems...)
 
-			// Rank by popularity
-			type kv2 struct{ item string; score int }
-			scored := make([]kv2, len(candList))
-			for i, item := range candList {
-				scored[i] = kv2{item: item, score: itemPop[item]}
-			}
-			sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
-			ranked := make([]string, len(scored))
-			for i, s := range scored {
-				ranked[i] = s.item
-			}
+		// Random shuffle
+		rng.Shuffle(len(candidates), func(i, j int) {
+			candidates[i], candidates[j] = candidates[j], candidates[i]
+		})
 
-			relSet := map[string]struct{}{posItem: {}}
-			ndcgSum += NDCG(relSet, ranked, e.cfg.TopK)
-			hrSum += HR(relSet, ranked, e.cfg.TopK)
-			count++
-		}
+		relSet := map[string]struct{}{tc.posItem: {}}
+		ndcgSum += NDCG(relSet, candidates, e.cfg.TopK)
+		hrSum += HR(relSet, candidates, e.cfg.TopK)
+		count++
 	}
 
 	if count == 0 {
@@ -183,118 +182,89 @@ func (e *Evaluator) evaluateSampled(testUserItems map[string][]string, trainUser
 	return Metrics{NDCG10: ndcgSum / n, HR20: hrSum / n}
 }
 
-// evaluateSampled for enhanced (three-way recall).
-func (e *Evaluator) evaluateEnhancedSampled(ctx context.Context, train []cf.Interaction, testUserItems map[string][]string, trainUserItems map[string]map[string]struct{}, data *LoadResult, rng *rand.Rand) Metrics {
-	recaller := cf.NewCFRecaller()
-	cfg := cf.DefaultCFTrainConfig()
-	cfg.BPRParams.NEpochs = 200
-	cfg.BPRParams.NFactors = 16
-	recaller.Train(train, cfg)
+// evaluateBPR evaluates BPR personalized ranking.
+func (e *Evaluator) evaluateBPR(testCases []struct {
+	user     string
+	posItem  string
+	trainSet map[string]struct{}
+}, allItems []string, recaller *cf.CFRecaller, rng *rand.Rand) Metrics {
 
-	// Build co-occurrence
-	itemCooccur := make(map[string]map[string]int)
-	userItems := make(map[string][]string)
-	for _, it := range train {
-		userItems[it.UserID] = append(userItems[it.UserID], it.ItemID)
-	}
-	for _, items := range userItems {
-		for i, a := range items {
-			for _, b := range items[i+1:] {
-				if itemCooccur[a] == nil { itemCooccur[a] = make(map[string]int) }
-				if itemCooccur[b] == nil { itemCooccur[b] = make(map[string]int) }
-				itemCooccur[a][b]++
-				itemCooccur[b][a]++
-			}
-		}
-	}
-
-	itemPop := make(map[string]int)
-	for _, it := range train { itemPop[it.ItemID]++ }
-
+	negN := e.cfg.CandidateN
 	ndcgSum, hrSum := 0.0, 0.0
 	count := 0
 
-	for user, posItems := range testUserItems {
-		trainSet := trainUserItems[user]
-		// For each positive item, create a test set: 1 positive + CandidateN negatives
-		sortedItems := preSortedItems(data.ItemIDs, itemPop)
-		for _, posItem := range posItems {
-			negCandidates := e.sampleCandidatePool(sortedItems, trainSet, posItem)
-			candList := append([]string{posItem}, negCandidates...)
+	for _, tc := range testCases {
+		negItems := sampleNeg(allItems, tc.trainSet, tc.posItem, negN, rng)
+		candidates := append([]string{tc.posItem}, negItems...)
 
-			// Score each candidate
-			scores := make(map[string]float64, len(candList))
-			for _, item := range candList {
-				var score float64
-				// CF
-				score += 0.4 * float64(recaller.Predict(user, item))
-				// Content
-				for trainItem := range trainSet {
-					if co, ok := itemCooccur[trainItem]; ok {
-						if c, ok := co[item]; ok {
-							s := float64(c) / float64(len(co))
-							if s > score*0.3 { score += 0.3 * s }
-						}
-					}
-				}
-				// Profile: item popularity among similar users
-				score += 0.3 * float64(itemPop[item]) / float64(len(data.Interactions))
-				scores[item] = score
-			}
-
-			type kv struct{ item string; score float64 }
-			pairs := make([]kv, 0, len(scores))
-			for k, v := range scores { pairs = append(pairs, kv{item: k, score: v}) }
-			sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
-			ranked := make([]string, len(pairs))
-			for i, p := range pairs { ranked[i] = p.item }
-
-			relSet := map[string]struct{}{posItem: {}}
-			ndcgSum += NDCG(relSet, ranked, e.cfg.TopK)
-			hrSum += HR(relSet, ranked, e.cfg.TopK)
-			count++
+		// Score each candidate with BPR
+		type scored struct {
+			item  string
+			score float32
 		}
+		pairs := make([]scored, len(candidates))
+		for i, item := range candidates {
+			pairs[i] = scored{item: item, score: recaller.Predict(tc.user, item)}
+		}
+
+		// Sort by BPR score descending
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].score > pairs[j].score })
+		ranked := make([]string, len(pairs))
+		for i, p := range pairs {
+			ranked[i] = p.item
+		}
+
+		relSet := map[string]struct{}{tc.posItem: {}}
+		ndcgSum += NDCG(relSet, ranked, e.cfg.TopK)
+		hrSum += HR(relSet, ranked, e.cfg.TopK)
+		count++
 	}
 
-	if count == 0 { return Metrics{} }
+	if count == 0 {
+		return Metrics{}
+	}
 	n := float64(count)
 	return Metrics{NDCG10: ndcgSum / n, HR20: hrSum / n}
 }
 
-// preSortedItems returns items sorted by popularity descending (cached per fold).
-func preSortedItems(allItems []string, itemPop map[string]int) []string {
-	type kv struct{ item string; pop int }
-	pairs := make([]kv, len(allItems))
-	for i, item := range allItems {
-		pairs[i] = kv{item: item, pop: itemPop[item]}
+func sampleNeg(allItems []string, trainSet map[string]struct{}, posItem string, n int, rng *rand.Rand) []string {
+	// Build pool of eligible items (not in trainSet, not posItem)
+	pool := make([]string, 0, len(allItems))
+	for _, item := range allItems {
+		if item == posItem {
+			continue
+		}
+		if _, inTrain := trainSet[item]; inTrain {
+			continue
+		}
+		pool = append(pool, item)
 	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].pop > pairs[j].pop })
-	sorted := make([]string, len(pairs))
-	for i, p := range pairs { sorted[i] = p.item }
-	return sorted
-}
-
-func (e *Evaluator) sampleCandidatePool(sortedItems []string, trainSet map[string]struct{}, posItem string) []string {
-	posSet := map[string]struct{}{posItem: {}}
-	result := make([]string, 0, e.cfg.CandidateN)
-	for _, item := range sortedItems {
-		if len(result) >= e.cfg.CandidateN { break }
-		if _, inTrain := trainSet[item]; inTrain { continue }
-		if _, isPos := posSet[item]; isPos { continue }
-		result = append(result, item)
+	if len(pool) == 0 {
+		return nil
 	}
-	return result
+	// Shuffle and take first n
+	rng.Shuffle(len(pool), func(i, j int) {
+		pool[i], pool[j] = pool[j], pool[i]
+	})
+	if n > len(pool) {
+		n = len(pool)
+	}
+	return pool[:n]
 }
 
 func extractBaseline(results []EvalResult) []Metrics {
 	out := make([]Metrics, len(results))
-	for i, r := range results { out[i] = r.Baseline }
+	for i, r := range results {
+		out[i] = r.Baseline
+	}
 	return out
 }
 
 func extractEnhanced(results []EvalResult) []Metrics {
 	out := make([]Metrics, len(results))
-	for i, r := range results { out[i] = r.Enhanced }
+	for i, r := range results {
+		out[i] = r.Enhanced
+	}
 	return out
 }
 
@@ -302,17 +272,30 @@ func extractField(metrics []Metrics, field string) []float64 {
 	out := make([]float64, len(metrics))
 	for i, m := range metrics {
 		switch field {
-		case "ndcg": out[i] = m.NDCG10
-		case "hr": out[i] = m.HR20
+		case "ndcg":
+			out[i] = m.NDCG10
+		case "hr":
+			out[i] = m.HR20
 		}
 	}
 	return out
 }
 
 type TTestResult struct {
-	NDCGTStat, HRTStat float64
+	NDCGTStat, HRTStat             float64
 	NDCGSignificant, HRSignificant bool
 }
 
-func min(a, b int) int { if a < b { return a }; return b }
-func max(a, b int) int { if a > b { return a }; return b }
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

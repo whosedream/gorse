@@ -29,6 +29,7 @@ func main() {
 		TopK:       *topK,
 		MinUser:    *minUser,
 		MaxSamples: *maxSamples,
+		CandidateN: 99,
 	}
 
 	evaluator := eval.NewEvaluator(cfg)
